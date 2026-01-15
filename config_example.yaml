@@ -1,0 +1,42 @@
+# Traudit Configuration Example
+
+database:
+  dsn: "clickhouse://admin:password@127.0.0.1:8123/audit_db"
+  batch:
+    size: 50
+    timeout_secs: 5
+
+services:
+  # Scenario: SSH High-Level Audit Gateway
+  # Receives traffic from FRP with v2 Proxy Protocol header, audits it,
+  # strips the header, and forwards pure TCP to local SSHD.
+  - name: "ssh-prod"
+    db_table: "ssh_audit_logs"
+    
+    binds:
+      # Entry 1: Public traffic from FRP
+      - type: "tcp"
+        addr: "0.0.0.0:1222"
+        proxy_protocol: "v2"
+      
+      # Entry 2: LAN direct traffic (no Proxy Protocol)
+      - type: "tcp"
+        addr: "0.0.0.0:1223"
+        
+    forward_type: "tcp"
+    forward_addr: "127.0.0.1:22"
+    # forward_proxy_protocol omitted, sends pure stream to SSHD
+
+  # Scenario: Protocol Conversion and Local Socket Forwarding
+  # Receives normal TCP traffic, converts to v1 Proxy Protocol header,
+  # and forwards to local Unix socket (Nginx).
+  - name: "web-gateway"
+    db_table: "http_access_audit"
+    
+    binds:
+      - type: "tcp"
+        addr: "0.0.0.0:8080"
+        
+    forward_type: "unix"
+    forward_addr: "/run/nginx/web.sock"
+    forward_proxy_protocol: "v1"
