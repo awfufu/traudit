@@ -1,0 +1,12 @@
+[Unit]
+Description=Traudit Reverse Proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/traudit -f /etc/traudit/config.yaml
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

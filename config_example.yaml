@@ -15,18 +15,18 @@ services:
     type: "tcp"
     binds:
       # Entry 1: Public traffic from FRP
-      - addr: "0.0.0.0:2222"
+      - addr: "0.0.0.0:2223"
         proxy: "v2"
 
       # Entry 2: LAN direct traffic (no Proxy Protocol)
-      - addr: "0.0.0.0:2233"
+      - addr: "0.0.0.0:2222"
         # no proxy
 
     forward_to: "127.0.0.1:22"
 
-  - name: "web"
-    type: "tcp"
-    binds:
-      - addr: "0.0.0.0:8080"
+  # - name: "web"
+  #   type: "tcp"
+  #   binds:
+  #     - addr: "0.0.0.0:8080"
         
-    forward_to: "/run/nginx/web.sock"
+  #   forward_to: "/run/nginx/web.sock"

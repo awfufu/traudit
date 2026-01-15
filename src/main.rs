@@ -19,6 +19,8 @@ fn print_help() {
   println!("  -f <config_file>  path to the yaml configuration file");
   println!("  -t, --test        test configuration and exit");
   println!("  -h, --help        print this help message");
+  println!();
+  println!("project: https://github.com/awfufu/traudit");
 }
 
 #[tokio::main]

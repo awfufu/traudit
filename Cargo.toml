@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 authors = ["awfufu"]
 description = "A reverse proxy with auditing capabilities."
+license = "MIT"
+repository = "https://github.com/awfufu/traudit"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -31,3 +33,28 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[package.metadata.deb]
+maintainer = "awfufu"
+copyright = "2026, awfufu"
+license-file = ["README.md", "4"]
+extended-description = """\
+A reverse proxy with auditing capabilities.
+"""
+depends = "$auto"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/traudit", "usr/bin/", "755"],
+    ["config_example.yaml", "etc/traudit/config.yaml", "644"],
+    ["traudit.service", "usr/lib/systemd/system/traudit.service", "644"],
+]
+conf-files = ["/etc/traudit/config.yaml"]
+
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/traudit", dest = "/usr/bin/traudit", mode = "755" },
+    { source = "config_example.yaml", dest = "/etc/traudit/config.yaml", mode = "644", config = true },
+    { source = "traudit.service", dest = "/usr/lib/systemd/system/traudit.service", mode = "644" },
+]
