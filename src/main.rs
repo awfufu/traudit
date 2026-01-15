@@ -20,8 +20,29 @@ fn print_help() {
   println!("  -h, --help        print this help message");
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+use monoio::time::TimeDriver;
+use monoio::{IoUringDriver, RuntimeBuilder};
+
+fn main() {
+  let mut uring_builder = io_uring::IoUring::builder();
+  uring_builder.setup_sqpoll(2000); // 2000ms idle timeout
+                                    // Optimizations for single-threaded runtime (requires Linux 6.0+)
+
+  let mut rt = RuntimeBuilder::<TimeDriver<IoUringDriver>>::new()
+    .with_entries(32768)
+    .uring_builder(uring_builder)
+    .build()
+    .unwrap();
+
+  rt.block_on(async {
+    if let Err(e) = run().await {
+      error!("application error: {}", e);
+      std::process::exit(1);
+    }
+  });
+}
+
+async fn run() -> anyhow::Result<()> {
   let args: Vec<String> = env::args().collect();
 
   let mut config_path = None;
@@ -70,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
 
   info!("loading config from {}", config_path.display());
 
-  let config = Config::load(&config_path).await.map_err(|e| {
+  let config = Config::load(&config_path).map_err(|e| {
     error!("failed to load config: {}", e);
     e
   })?;

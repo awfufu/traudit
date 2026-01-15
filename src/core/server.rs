@@ -3,16 +3,14 @@ use crate::core::forwarder;
 use crate::core::upstream::UpstreamStream;
 use crate::db::clickhouse::ClickHouseLogger;
 use crate::protocol;
+use monoio::net::TcpListener;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
-use tokio::signal;
 use tracing::{error, info};
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
   let db = Arc::new(ClickHouseLogger::new(&config.database));
 
-  let mut join_set = tokio::task::JoinSet::new();
+  let mut handles = Vec::new();
 
   for service in config.services {
     let db = db.clone();
@@ -23,19 +21,22 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
       let bind_type = bind.bind_type;
 
       if bind_type == BindType::Tcp {
-        let listener = TcpListener::bind(&bind_addr).await.map_err(|e| {
-          error!("[{}] failed to bind {}: {}", service_config.name, bind_addr, e);
+        let listener = TcpListener::bind(&bind_addr).map_err(|e| {
+          error!(
+            "[{}] failed to bind {}: {}",
+            service_config.name, bind_addr, e
+          );
           e
         })?;
 
         info!("[{}] listening on tcp {}", service_config.name, bind_addr);
 
-        join_set.spawn(start_tcp_service(
+        handles.push(monoio::spawn(start_tcp_service(
           service_config,
           listener,
           proxy_protocol,
           db.clone(),
-        ));
+        )));
       } else {
         info!("skipping non-tcp bind for now: {:?}", bind_type);
       }
@@ -53,16 +54,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
   }
 
-  match signal::ctrl_c().await {
-    Ok(()) => {
-      info!("shutdown signal received.");
-    }
-    Err(err) => {
-      error!("unable to listen for shutdown signal: {}", err);
-    }
+  // Monoio doesn't have a signal::ctrl_c helper built-in effectively like tokio's
+  // But we can just wait on the handles or use a simple waiting mechanism.
+  // For now, we await the services. Since they loop forever, this runs forever.
+  // TODO: Implement signal handling for graceful shutdown if needed.
+  for h in handles {
+    let _ = h.await;
   }
-
-  join_set.shutdown().await;
 
   Ok(())
 }
@@ -76,20 +74,16 @@ async fn start_tcp_service(
   loop {
     match listener.accept().await {
       Ok((inbound, _client_addr)) => {
-        // log moved to handle_connection for consistent real ip logging
         let service = service.clone();
-        // let db = _db.clone();
-
-        tokio::spawn(async move {
+        monoio::spawn(async move {
           if let Err(e) = handle_connection(inbound, service, proxy_protocol).await {
             match e.kind() {
-                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
-                    // normal disconnects, debug log only
-                    tracing::debug!("connection closed: {}", e);
-                }
-                _ => {
-                    error!("connection error: {}", e);
-                }
+              std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
+                tracing::debug!("connection closed: {}", e);
+              }
+              _ => {
+                error!("connection error: {}", e);
+              }
             }
           }
         });
@@ -102,12 +96,12 @@ async fn start_tcp_service(
 }
 
 async fn handle_connection(
-  mut inbound: tokio::net::TcpStream,
+  mut inbound: monoio::net::TcpStream,
   service: ServiceConfig,
   proxy_protocol: bool,
 ) -> std::io::Result<()> {
   // read proxy protocol (if configured)
-  let (_client_addr, mut buffer) = if proxy_protocol {
+  let (_client_addr, buffer) = if proxy_protocol {
     let (proxy_info, buffer) = protocol::read_proxy_header(&mut inbound).await?;
     if let Some(info) = proxy_info {
       let physical = inbound.peer_addr()?;
@@ -127,18 +121,18 @@ async fn handle_connection(
   // connect upstream
   let mut upstream = UpstreamStream::connect(service.forward_type, &service.forward_addr).await?;
 
-  // forward header (TODO: if configured)
-
   // write buffered data (peeked bytes)
   if !buffer.is_empty() {
-    upstream.write_all_buf(&mut buffer).await?;
+    // UpstreamStream needs to support writing bytes directly
+    // logic needs update in upstream.rs
+    upstream.write_all(buffer).await.0?;
   }
 
   // zero-copy forwarding
-  let inbound_async = crate::core::upstream::AsyncStream::from_tokio_tcp(inbound)?;
-  let upstream_async = upstream.into_async_stream()?;
+  // Monoio's TcpStream is already compatible with splice if we access the fd,
+  // but better to pass the stream itself to forwarder.
 
-  forwarder::zero_copy_bidirectional(inbound_async, upstream_async).await?;
+  forwarder::zero_copy_bidirectional(inbound, upstream).await?;
 
   Ok(())
 }

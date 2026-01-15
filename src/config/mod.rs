@@ -1,6 +1,5 @@
 use serde::Deserialize;
 use std::path::Path;
-use tokio::fs;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -62,8 +61,8 @@ pub enum ProxyProtocolVersion {
 }
 
 impl Config {
-  pub async fn load<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
-    let content = fs::read_to_string(path).await?;
+  pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
+    let content = std::fs::read_to_string(path)?;
     let config: Config = serde_yaml::from_str(&content)?;
     Ok(config)
   }
@@ -99,7 +98,7 @@ services:
     // Close the file handle so tokio can read it, or just keep it open and read by path?
     // tempfile deletes on drop. We need to keep `file` alive.
 
-    let config = Config::load(&path).await.expect("Failed to load config");
+    let config = Config::load(&path).expect("Failed to load config");
 
     assert_eq!(
       config.database.dsn,

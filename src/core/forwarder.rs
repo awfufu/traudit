@@ -1,65 +1,96 @@
-use crate::core::upstream::AsyncStream;
+use crate::core::upstream::UpstreamStream;
+use monoio::fs::File;
+use monoio::io::splice::{SpliceDestination, SpliceSource};
+use monoio::io::Splitable;
+use monoio::net::unix::new_pipe;
+use monoio::net::TcpStream;
 use std::io;
+use std::os::unix::io::AsRawFd;
 
-// Actual implementation below
-// Spliceable trait and its implementations are removed as AsyncStream handles readiness internally.
+const SPLICE_SIZE: u32 = 1024 * 1024; // 1MB
 
-async fn splice_loop(read: &AsyncStream, write: &AsyncStream) -> io::Result<u64> {
-  let mut pipe = [0i32; 2];
-  if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
-    return Err(io::Error::last_os_error());
+async fn transfer<R, W>(mut read: R, mut write: W) -> io::Result<()>
+where
+  R: SpliceSource,
+  W: SpliceDestination,
+{
+  // Double buffering: Create two pipes
+  let (mut p1_r, mut p1_w) = new_pipe()?;
+  let (mut p2_r, mut p2_w) = new_pipe()?;
+
+  // Resize both pipes
+  unsafe {
+    let f1_r: &File = std::mem::transmute(&p1_r);
+    let f1_w: &File = std::mem::transmute(&p1_w);
+    let f2_r: &File = std::mem::transmute(&p2_r);
+    let f2_w: &File = std::mem::transmute(&p2_w);
+
+    libc::fcntl(f1_r.as_raw_fd(), 1031, SPLICE_SIZE as libc::c_int);
+    libc::fcntl(f1_w.as_raw_fd(), 1031, SPLICE_SIZE as libc::c_int);
+    libc::fcntl(f2_r.as_raw_fd(), 1031, SPLICE_SIZE as libc::c_int);
+    libc::fcntl(f2_w.as_raw_fd(), 1031, SPLICE_SIZE as libc::c_int);
   }
-  let (pipe_rd, pipe_wr) = (pipe[0], pipe[1]);
 
-  struct PipeGuard(i32, i32);
-  impl Drop for PipeGuard {
-    fn drop(&mut self) {
-      unsafe {
-        libc::close(self.0);
-        libc::close(self.1);
-      }
-    }
+  // Prime the first pipe
+  let n = read.splice_to_pipe(&mut p1_w, SPLICE_SIZE).await?;
+  if n == 0 {
+    return Ok(());
   }
-  let _guard = PipeGuard(pipe_rd, pipe_wr);
-
-  let mut total_bytes = 0;
 
   loop {
-    // src -> pipe
-    // splice_read handles readiness internally with AsyncFd
-    let len = match read.splice_read(pipe_wr, 65536).await {
-      Ok(0) => return Ok(total_bytes), // EOF
-      Ok(n) => n,
-      Err(e) => return Err(e),
-    };
+    // Write from p1_r -> write AND Read from read -> p2_w
+    let (res_w, res_r) = monoio::join!(
+      write.splice_from_pipe(&mut p1_r, SPLICE_SIZE),
+      read.splice_to_pipe(&mut p2_w, SPLICE_SIZE)
+    );
 
-    // pipe -> dst
-    let mut written = 0;
-    while written < len {
-      let to_write = len - written;
-      let n = write.splice_write(pipe_rd, to_write).await?;
-      if n == 0 {
-        return Err(io::Error::new(
-          io::ErrorKind::WriteZero,
-          "Zero write in splice logic",
-        ));
-      }
-      written += n;
-      total_bytes += n as u64;
+    let _w = res_w?;
+    let r = res_r?;
+
+    if r == 0 {
+      return Ok(());
     }
+
+    // Swap pipes so p2 becomes the source for next write, and p1 becomes available for read
+    std::mem::swap(&mut p1_r, &mut p2_r);
+    std::mem::swap(&mut p1_w, &mut p2_w);
+  }
+}
+
+fn set_busy_poll(fd: std::os::unix::io::RawFd, us: libc::c_int) {
+  unsafe {
+    let val = us;
+    libc::setsockopt(
+      fd,
+      libc::SOL_SOCKET,
+      50, // SO_BUSY_POLL is 50 on Linux
+      &val as *const _ as *const libc::c_void,
+      std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+    );
   }
 }
 
 pub async fn zero_copy_bidirectional(
-  inbound: AsyncStream,
-  outbound: AsyncStream,
+  inbound: TcpStream,
+  outbound: UpstreamStream,
 ) -> io::Result<()> {
-  // We own the streams now, so we can split references to them for the join.
-  let (c2s, s2c) = tokio::join!(
-    splice_loop(&inbound, &outbound),
-    splice_loop(&outbound, &inbound)
-  );
-  c2s?;
-  s2c?;
+  set_busy_poll(inbound.as_raw_fd(), 50);
+
+  let (in_r, in_w) = inbound.into_split();
+  match outbound {
+    UpstreamStream::Tcp(s) => {
+      set_busy_poll(s.as_raw_fd(), 50);
+      let (out_r, out_w) = s.into_split();
+      let (r1, r2) = monoio::join!(transfer(in_r, out_w), transfer(out_r, in_w));
+      r1?;
+      r2?;
+    }
+    UpstreamStream::Unix(s) => {
+      let (out_r, out_w) = s.into_split();
+      let (r1, r2) = monoio::join!(transfer(in_r, out_w), transfer(out_r, in_w));
+      r1?;
+      r2?;
+    }
+  }
   Ok(())
 }

@@ -1,7 +1,7 @@
 use bytes::BytesMut;
+use monoio::io::AsyncReadRent;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use tokio::io::{AsyncRead, AsyncReadExt};
 
 #[derive(Debug, Clone)]
 pub struct ProxyInfo {
@@ -19,7 +19,7 @@ pub enum Version {
 const V1_PREFIX: &[u8] = b"PROXY ";
 const V2_PREFIX: &[u8] = b"\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"; // 12 bytes
 
-pub async fn read_proxy_header<T: AsyncRead + Unpin>(
+pub async fn read_proxy_header<T: AsyncReadRent>(
   stream: &mut T,
 ) -> io::Result<(Option<ProxyInfo>, BytesMut)> {
   let mut buf = BytesMut::with_capacity(512);
@@ -27,7 +27,9 @@ pub async fn read_proxy_header<T: AsyncRead + Unpin>(
   // Read enough to distinguish version
 
   // Initial read
-  let n = stream.read_buf(&mut buf).await?;
+  let (res, b) = stream.read(buf).await;
+  buf = b;
+  let n = res?;
   if n == 0 {
     return Ok((None, buf));
   }
@@ -48,7 +50,7 @@ pub async fn read_proxy_header<T: AsyncRead + Unpin>(
   Ok((None, buf))
 }
 
-async fn parse_v1<T: AsyncRead + Unpin>(
+async fn parse_v1<T: AsyncReadRent>(
   stream: &mut T,
   mut buf: BytesMut,
 ) -> io::Result<(Option<ProxyInfo>, BytesMut)> {
@@ -88,7 +90,9 @@ async fn parse_v1<T: AsyncRead + Unpin>(
     }
 
     // Read more
-    let n = stream.read_buf(&mut buf).await?;
+    let (res, b) = stream.read(buf).await;
+    buf = b;
+    let n = res?;
     if n == 0 {
       return Err(io::Error::new(
         io::ErrorKind::UnexpectedEof,
@@ -104,7 +108,7 @@ async fn parse_v1<T: AsyncRead + Unpin>(
   }
 }
 
-async fn parse_v2<T: AsyncRead + Unpin>(
+async fn parse_v2<T: AsyncReadRent>(
   stream: &mut T,
   mut buf: BytesMut,
 ) -> io::Result<(Option<ProxyInfo>, BytesMut)> {
@@ -114,7 +118,9 @@ async fn parse_v2<T: AsyncRead + Unpin>(
   // 15th-16th: len (u16 big endian)
 
   while buf.len() < 16 {
-    let n = stream.read_buf(&mut buf).await?;
+    let (res, b) = stream.read(buf).await;
+    buf = b;
+    let n = res?;
     if n == 0 {
       return Err(io::Error::new(
         io::ErrorKind::UnexpectedEof,
@@ -138,7 +144,9 @@ async fn parse_v2<T: AsyncRead + Unpin>(
 
   // Read payload
   while buf.len() < 16 + len {
-    let n = stream.read_buf(&mut buf).await?;
+    let (res, b) = stream.read(buf).await;
+    buf = b;
+    let n = res?;
     if n == 0 {
       return Err(io::Error::new(
         io::ErrorKind::UnexpectedEof,
