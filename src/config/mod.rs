@@ -11,22 +11,27 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct DatabaseConfig {
   pub dsn: String,
+  #[allow(dead_code)]
   pub batch: BatchConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct BatchConfig {
+  #[allow(dead_code)]
   pub size: usize,
+  #[allow(dead_code)]
   pub timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServiceConfig {
   pub name: String,
+  #[allow(dead_code)]
   pub db_table: String,
   pub binds: Vec<BindConfig>,
   pub forward_type: ForwardType,
   pub forward_addr: String,
+  #[allow(dead_code)]
   pub forward_proxy_protocol: Option<ProxyProtocolVersion>,
 }
 
@@ -35,6 +40,7 @@ pub struct BindConfig {
   #[serde(rename = "type")]
   pub bind_type: BindType,
   pub addr: String,
+  #[serde(alias = "proxy")]
   pub proxy_protocol: Option<ProxyProtocolVersion>,
 }
 

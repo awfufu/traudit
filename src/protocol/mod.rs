@@ -7,7 +7,6 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 pub struct ProxyInfo {
   pub version: Version,
   pub source: SocketAddr,
-  pub destination: SocketAddr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,28 +23,45 @@ pub async fn read_proxy_header<T: AsyncRead + Unpin>(
 ) -> io::Result<(Option<ProxyInfo>, BytesMut)> {
   let mut buf = BytesMut::with_capacity(512);
 
-  // Read enough to distinguish version
+  loop {
+    if !buf.is_empty() {
+      // Check potential V2 match
+      let v2_match = if buf.len() <= V2_PREFIX.len() {
+        V2_PREFIX.starts_with(&buf)
+      } else {
+        buf.starts_with(V2_PREFIX)
+      };
 
-  // Initial read
-  let n = stream.read_buf(&mut buf).await?;
-  if n == 0 {
-    return Ok((None, buf));
+      // Check potential V1 match
+      let v1_match = if buf.len() <= V1_PREFIX.len() {
+        V1_PREFIX.starts_with(&buf)
+      } else {
+        buf.starts_with(V1_PREFIX)
+      };
+
+      // If matches neither, it's not a proxy header
+      if !v2_match && !v1_match {
+        return Ok((None, buf));
+      }
+
+      // If identified as V2 (full signature match)
+      if buf.len() >= 12 && buf.starts_with(V2_PREFIX) {
+        return parse_v2(stream, buf).await;
+      }
+
+      // If identified as V1 (full signature match)
+      if buf.len() >= 6 && buf.starts_with(V1_PREFIX) {
+        return parse_v1(stream, buf).await;
+      }
+    }
+
+    // Need more data to decide
+    let n = stream.read_buf(&mut buf).await?;
+    if n == 0 {
+      // EOF before header complete/identified
+      return Ok((None, buf));
+    }
   }
-
-  // Check V2
-  if buf.len() >= 12 && &buf[..12] == V2_PREFIX {
-    // v2
-    return parse_v2(stream, buf).await;
-  }
-
-  // Check V1
-  if buf.len() >= 6 && &buf[..6] == V1_PREFIX {
-    // v1
-    return parse_v1(stream, buf).await;
-  }
-
-  // Neither
-  Ok((None, buf))
 }
 
 async fn parse_v1<T: AsyncRead + Unpin>(
@@ -65,13 +81,13 @@ async fn parse_v1<T: AsyncRead + Unpin>(
         let src_ip: IpAddr = parts[2]
           .parse()
           .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid src IP"))?;
-        let dst_ip: IpAddr = parts[3]
+        let _dst_ip: IpAddr = parts[3]
           .parse()
           .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid dst IP"))?;
         let src_port: u16 = parts[4]
           .parse()
           .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid src port"))?;
-        let dst_port: u16 = parts[5]
+        let _dst_port: u16 = parts[5]
           .parse()
           .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid dst port"))?;
 
@@ -79,7 +95,6 @@ async fn parse_v1<T: AsyncRead + Unpin>(
           Some(ProxyInfo {
             version: Version::V1,
             source: SocketAddr::new(src_ip, src_port),
-            destination: SocketAddr::new(dst_ip, dst_port),
           }),
           buf,
         ));
@@ -160,14 +175,13 @@ async fn parse_v2<T: AsyncRead + Unpin>(
       // TCP/UDP over IPv4
       if payload.len() >= 12 {
         let src_ip = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
-        let dst_ip = Ipv4Addr::new(payload[4], payload[5], payload[6], payload[7]);
+        let _dst_ip = Ipv4Addr::new(payload[4], payload[5], payload[6], payload[7]);
         let src_port = u16::from_be_bytes([payload[8], payload[9]]);
-        let dst_port = u16::from_be_bytes([payload[10], payload[11]]);
+        let _dst_port = u16::from_be_bytes([payload[10], payload[11]]);
         return Ok((
           Some(ProxyInfo {
             version: Version::V2,
             source: SocketAddr::new(IpAddr::V4(src_ip), src_port),
-            destination: SocketAddr::new(IpAddr::V4(dst_ip), dst_port),
           }),
           buf,
         ));
@@ -180,15 +194,14 @@ async fn parse_v2<T: AsyncRead + Unpin>(
         // Keep it brief
         let mut src = [0u8; 16];
         src.copy_from_slice(&payload[0..16]);
-        let mut dst = [0u8; 16];
-        dst.copy_from_slice(&payload[16..32]);
+        let mut _dst = [0u8; 16];
+        _dst.copy_from_slice(&payload[16..32]);
         let src_port = u16::from_be_bytes([payload[32], payload[33]]);
-        let dst_port = u16::from_be_bytes([payload[34], payload[35]]);
+        let _dst_port = u16::from_be_bytes([payload[34], payload[35]]);
         return Ok((
           Some(ProxyInfo {
             version: Version::V2,
             source: SocketAddr::new(IpAddr::V6(Ipv6Addr::from(src)), src_port),
-            destination: SocketAddr::new(IpAddr::V6(Ipv6Addr::from(dst)), dst_port),
           }),
           buf,
         ));

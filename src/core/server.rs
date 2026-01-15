@@ -12,6 +12,12 @@ use tracing::{error, info};
 pub async fn run(config: Config) -> anyhow::Result<()> {
   let db = Arc::new(ClickHouseLogger::new(&config.database));
 
+  // init db table
+  if let Err(e) = db.init().await {
+    error!("failed to init database: {}", e);
+    return Err(e);
+  }
+
   let mut join_set = tokio::task::JoinSet::new();
 
   for service in config.services {
@@ -24,7 +30,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
       if bind_type == BindType::Tcp {
         let listener = TcpListener::bind(&bind_addr).await.map_err(|e| {
-          error!("[{}] failed to bind {}: {}", service_config.name, bind_addr, e);
+          error!(
+            "[{}] failed to bind {}: {}",
+            service_config.name, bind_addr, e
+          );
           e
         })?;
 
@@ -71,25 +80,24 @@ async fn start_tcp_service(
   service: ServiceConfig,
   listener: TcpListener,
   proxy_protocol: bool,
-  _db: Arc<ClickHouseLogger>,
+  db: Arc<ClickHouseLogger>,
 ) {
   loop {
     match listener.accept().await {
       Ok((inbound, _client_addr)) => {
-        // log moved to handle_connection for consistent real ip logging
         let service = service.clone();
-        // let db = _db.clone();
+        let db = db.clone();
 
         tokio::spawn(async move {
-          if let Err(e) = handle_connection(inbound, service, proxy_protocol).await {
+          if let Err(e) = handle_connection(inbound, service, proxy_protocol, db).await {
             match e.kind() {
-                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
-                    // normal disconnects, debug log only
-                    tracing::debug!("connection closed: {}", e);
-                }
-                _ => {
-                    error!("connection error: {}", e);
-                }
+              std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
+                // normal disconnects, debug log only
+                tracing::debug!("connection closed: {}", e);
+              }
+              _ => {
+                error!("connection error: {}", e);
+              }
             }
           }
         });
@@ -105,40 +113,104 @@ async fn handle_connection(
   mut inbound: tokio::net::TcpStream,
   service: ServiceConfig,
   proxy_protocol: bool,
-) -> std::io::Result<()> {
-  // read proxy protocol (if configured)
-  let (_client_addr, mut buffer) = if proxy_protocol {
-    let (proxy_info, buffer) = protocol::read_proxy_header(&mut inbound).await?;
-    if let Some(info) = proxy_info {
-      let physical = inbound.peer_addr()?;
-      info!("[{}] <- {} ({})", service.name, info.source, physical);
-      (info.source, buffer)
+  db: Arc<ClickHouseLogger>,
+) -> std::io::Result<u64> {
+  let conn_ts = time::OffsetDateTime::now_utc();
+  let start_instant = std::time::Instant::now();
+
+  // Default metadata
+  let mut final_ip = inbound.peer_addr()?.ip();
+  let mut final_port = inbound.peer_addr()?.port();
+  let mut proto_enum = crate::db::clickhouse::ProxyProto::None;
+
+  let result = async {
+    // read proxy protocol (if configured)
+    let mut buffer = bytes::BytesMut::new();
+
+    if proxy_protocol {
+      match protocol::read_proxy_header(&mut inbound).await {
+        Ok((proxy_info, buf)) => {
+          buffer = buf;
+          if let Some(info) = proxy_info {
+            let physical = inbound.peer_addr()?;
+            info!("[{}] <- {} ({})", service.name, info.source, physical);
+            final_ip = info.source.ip();
+            final_port = info.source.port();
+            proto_enum = match info.version {
+              protocol::Version::V1 => crate::db::clickhouse::ProxyProto::V1,
+              protocol::Version::V2 => crate::db::clickhouse::ProxyProto::V2,
+            };
+          } else {
+            // Strict enforcement: if configured with proxy_protocol, MUST have a header
+            let physical = inbound.peer_addr()?;
+            let msg = format!("strict proxy protocol violation from {}", physical);
+            error!("[{}] {}", service.name, msg);
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+          }
+        }
+        Err(e) => return Err(e),
+      }
     } else {
       let addr = inbound.peer_addr()?;
       info!("[{}] <- {}", service.name, addr);
-      (addr, buffer)
     }
+
+    // connect upstream
+    let mut upstream = UpstreamStream::connect(service.forward_type, &service.forward_addr).await?;
+
+    // write buffered data (peeked bytes)
+    if !buffer.is_empty() {
+      upstream.write_all_buf(&mut buffer).await?;
+    }
+
+    // zero-copy forwarding
+    let inbound_async = crate::core::upstream::AsyncStream::from_tokio_tcp(inbound)?;
+    let upstream_async = upstream.into_async_stream()?;
+
+    let (spliced_bytes, splice_res) =
+      forwarder::zero_copy_bidirectional(inbound_async, upstream_async).await;
+
+    if let Err(e) = splice_res {
+      match e.kind() {
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
+          tracing::debug!("[{}] connection closed with error: {}", service.name, e);
+        }
+        _ => {
+          error!("[{}] connection error: {}", service.name, e);
+        }
+      }
+    } else {
+      info!("[{}] connection closed cleanly", service.name);
+    }
+
+    // Total bytes = initial peeked/buffered payload + filtered bytes
+    Ok(spliced_bytes + buffer.len() as u64)
+  }
+  .await;
+
+  let duration = if result.is_ok() {
+    start_instant.elapsed().as_millis() as u32
   } else {
-    let addr = inbound.peer_addr()?;
-    info!("[{}] <- {}", service.name, addr);
-    (addr, bytes::BytesMut::new())
+    0
   };
 
-  // connect upstream
-  let mut upstream = UpstreamStream::connect(service.forward_type, &service.forward_addr).await?;
+  let bytes_transferred = result.as_ref().unwrap_or(&0).clone();
 
-  // forward header (TODO: if configured)
+  let log_entry = crate::db::clickhouse::TcpLog {
+    service: service.name.clone(),
+    conn_ts,
+    duration,
+    port: final_port,
+    ip: final_ip,
+    proxy_proto: proto_enum,
+    bytes: bytes_transferred,
+  };
 
-  // write buffered data (peeked bytes)
-  if !buffer.is_empty() {
-    upstream.write_all_buf(&mut buffer).await?;
-  }
+  tokio::spawn(async move {
+    if let Err(e) = db.insert_log(log_entry).await {
+      error!("failed to insert tcp log: {}", e);
+    }
+  });
 
-  // zero-copy forwarding
-  let inbound_async = crate::core::upstream::AsyncStream::from_tokio_tcp(inbound)?;
-  let upstream_async = upstream.into_async_stream()?;
-
-  forwarder::zero_copy_bidirectional(inbound_async, upstream_async).await?;
-
-  Ok(())
+  result
 }

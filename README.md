@@ -21,17 +21,16 @@ See [config_example.yaml](config_example.yaml).
 
 - [x] Core Implementation
     - [x] Configuration parsing (`serde_yaml`)
-    - [x] TCP/UDP/Unix Listener abstraction
-    - [x] Proxy Protocol parsing & handling
-    - [x] Zero-copy forwarding loop (`splice`)
-- [ ] Database Integration
-    - [ ] Define Audit Log schema
-    - [ ] Implement `AuditLogger` trait
-    - [ ] ClickHouse adapter
-    - [ ] SQLite/MySQL adapters
-- [x] Testing
-    - [ ] Unit tests for config & protocol
-    - [x] End-to-end forwarding tests
-- [ ] Documentation
-    - [ ] Detailed configuration guide
-    - [ ] Deployment guide
+    - [x] TCP Proxy & Zero-copy forwarding (`splice`)
+    - [x] Proxy Protocol V1/V2 parsing
+    - [ ] UDP Forwarding (Planned)
+    - [ ] Unix Socket Forwarding (Planned)
+- [x] Database Integration
+    - [x] ClickHouse Adapter (Native Interface)
+    - [x] Traffic Accounting (Bytes/Bandwidth)
+    - [x] IPv6 Support
+    - [ ] SQLite/MySQL Adapters (Future)
+- [ ] Documentation & Testing
+    - [x] Basic End-to-end tests
+    - [ ] Comprehensive Unit Tests
+    - [ ] Deployment Guide

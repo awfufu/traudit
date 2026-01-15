@@ -21,17 +21,16 @@ traudit 是一个支持 TCP/UDP/Unix Socket 的反向代理程序，专注于连
 
 - [x] 核心功能
     - [x] 配置文件解析 (`serde_yaml`)
-    - [x] 监听器抽象 (TCP/UDP/Unix)
-    - [x] Proxy Protocol 解析与处理
-    - [x] 零拷贝转发循环 (`splice`)
-- [ ] 数据库
-    - [ ] 定义审计日志结构
-    - [ ] 实现 `AuditLogger` Trait
-    - [ ] ClickHouse 适配器
-    - [ ] SQLite/MySQL 适配器
-- [x] 测试
-    - [ ] 单元测试 (配置与协议)
-    - [x] 端到端转发测试
-- [ ] 文档
-    - [ ] 详细配置指南
+    - [x] TCP 代理与零拷贝转发 (`splice`)
+    - [x] Proxy Protocol V1/V2 解析
+    - [ ] UDP 转发 (计划中)
+    - [ ] Unix Socket 转发 (计划中)
+- [x] 数据库集成
+    - [x] ClickHouse 适配器 (原生接口)
+    - [x] 流量统计 (字节数)
+    - [x] IPv6 支持
+    - [ ] SQLite/MySQL 适配器 (计划中)
+- [ ] 文档与测试
+    - [x] 基础端到端测试
+    - [ ] 单元测试
     - [ ] 部署文档
