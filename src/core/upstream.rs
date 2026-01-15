@@ -1,4 +1,3 @@
-use crate::config::ForwardType;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
@@ -13,21 +12,14 @@ pub enum UpstreamStream {
 }
 
 impl UpstreamStream {
-  pub async fn connect(fw_type: ForwardType, addr: &str) -> io::Result<Self> {
-    match fw_type {
-      ForwardType::Tcp => {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        Ok(UpstreamStream::Tcp(stream))
-      }
-      ForwardType::Unix => {
-        let stream = UnixStream::connect(addr).await?;
-        Ok(UpstreamStream::Unix(stream))
-      }
-      ForwardType::Udp => Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "UDP forwarding not yet implemented in stream context",
-      )),
+  pub async fn connect(addr: &str) -> io::Result<Self> {
+    if addr.starts_with('/') {
+      let stream = UnixStream::connect(addr).await?;
+      Ok(UpstreamStream::Unix(stream))
+    } else {
+      let stream = TcpStream::connect(addr).await?;
+      stream.set_nodelay(true)?;
+      Ok(UpstreamStream::Tcp(stream))
     }
   }
 }

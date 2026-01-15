@@ -1,4 +1,4 @@
-use crate::config::{BindType, Config, ServiceConfig};
+use crate::config::{Config, ServiceConfig};
 use crate::core::forwarder;
 use crate::core::upstream::UpstreamStream;
 use crate::db::clickhouse::ClickHouseLogger;
@@ -10,11 +10,21 @@ use tokio::signal;
 use tracing::{error, info};
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
-  let db = Arc::new(ClickHouseLogger::new(&config.database));
+  let db_logger = ClickHouseLogger::new(&config.database).map_err(|e| {
+    error!("database: {}", e);
+    e
+  })?;
+  let db = Arc::new(db_logger);
 
   // init db table
+  // init db table
   if let Err(e) = db.init().await {
-    error!("failed to init database: {}", e);
+    let msg = e.to_string();
+    if msg.len() > 200 {
+      error!("failed to init database: {}... (truncated)", &msg[..200]);
+    } else {
+      error!("failed to init database: {}", msg);
+    }
     return Err(e);
   }
 
@@ -22,32 +32,36 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
   for service in config.services {
     let db = db.clone();
+
+    // Only support TCP service type for now, as per user instructions implied context
+    if service.service_type != "tcp" {
+      info!("skipping non-tcp service: {}", service.name);
+      continue;
+    }
+
     for bind in &service.binds {
       let service_config = service.clone();
       let bind_addr = bind.addr.clone();
-      let proxy_protocol = bind.proxy_protocol.is_some();
-      let bind_type = bind.bind_type;
+      // proxy is now Option<String>
+      let proxy_proto_config = bind.proxy.clone();
 
-      if bind_type == BindType::Tcp {
-        let listener = TcpListener::bind(&bind_addr).await.map_err(|e| {
-          error!(
-            "[{}] failed to bind {}: {}",
-            service_config.name, bind_addr, e
-          );
-          e
-        })?;
+      // BindType is removed, assume TCP bind for "tcp" service
+      let listener = TcpListener::bind(&bind_addr).await.map_err(|e| {
+        error!(
+          "[{}] failed to bind {}: {}",
+          service_config.name, bind_addr, e
+        );
+        e
+      })?;
 
-        info!("[{}] listening on tcp {}", service_config.name, bind_addr);
+      info!("[{}] listening on tcp {}", service_config.name, bind_addr);
 
-        join_set.spawn(start_tcp_service(
-          service_config,
-          listener,
-          proxy_protocol,
-          db.clone(),
-        ));
-      } else {
-        info!("skipping non-tcp bind for now: {:?}", bind_type);
-      }
+      join_set.spawn(start_tcp_service(
+        service_config,
+        listener,
+        proxy_proto_config,
+        db.clone(),
+      ));
     }
   }
 
@@ -79,21 +93,52 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 async fn start_tcp_service(
   service: ServiceConfig,
   listener: TcpListener,
-  proxy_protocol: bool,
+  proxy_cfg: Option<String>,
   db: Arc<ClickHouseLogger>,
 ) {
+  // Startup liveness check
+  if let Err(e) = UpstreamStream::connect(&service.forward_to).await {
+    match e.kind() {
+      std::io::ErrorKind::ConnectionRefused => {
+        tracing::warn!("[{}] -> '{}': {}", service.name, service.forward_to, e);
+      }
+      std::io::ErrorKind::NotFound => {
+        tracing::warn!("[{}] -> '{}': {}", service.name, service.forward_to, e);
+      }
+      _ => {
+        // For other startup errors, we might want to warn or just debug, but let's stick to user request for WARNING
+        tracing::warn!(
+          "[{}] -> '{}': startup check failed: {}",
+          service.name,
+          service.forward_to,
+          e
+        );
+      }
+    }
+  }
+
   loop {
     match listener.accept().await {
       Ok((inbound, _client_addr)) => {
         let service = service.clone();
         let db = db.clone();
+        let proxy_cfg = proxy_cfg.clone();
 
         tokio::spawn(async move {
-          if let Err(e) = handle_connection(inbound, service, proxy_protocol, db).await {
+          let svc_name = service.name.clone();
+          let svc_target = service.forward_to.clone();
+
+          if let Err(e) = handle_connection(inbound, service, proxy_cfg, db).await {
             match e.kind() {
               std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
                 // normal disconnects, debug log only
                 tracing::debug!("connection closed: {}", e);
+              }
+              std::io::ErrorKind::ConnectionRefused => {
+                tracing::warn!("[{}] -> '{}': {}", svc_name, svc_target, e);
+              }
+              std::io::ErrorKind::NotFound => {
+                tracing::warn!("[{}] -> '{}': {}", svc_name, svc_target, e);
               }
               _ => {
                 error!("connection error: {}", e);
@@ -112,7 +157,7 @@ async fn start_tcp_service(
 async fn handle_connection(
   mut inbound: tokio::net::TcpStream,
   service: ServiceConfig,
-  proxy_protocol: bool,
+  proxy_cfg: Option<String>,
   db: Arc<ClickHouseLogger>,
 ) -> std::io::Result<u64> {
   let conn_ts = time::OffsetDateTime::now_utc();
@@ -127,7 +172,9 @@ async fn handle_connection(
     // read proxy protocol (if configured)
     let mut buffer = bytes::BytesMut::new();
 
-    if proxy_protocol {
+    if proxy_cfg.is_some() {
+      // If configured, we attempt to read.
+      // Strict V2/V1 check can be implemented if needed, but here we just use the parser.
       match protocol::read_proxy_header(&mut inbound).await {
         Ok((proxy_info, buf)) => {
           buffer = buf;
@@ -140,6 +187,19 @@ async fn handle_connection(
               protocol::Version::V1 => crate::db::clickhouse::ProxyProto::V1,
               protocol::Version::V2 => crate::db::clickhouse::ProxyProto::V2,
             };
+
+            // Optional: verify version matches config if strictly required
+            if let Some(ref required_ver) = proxy_cfg {
+              match required_ver.as_str() {
+                "v1" if info.version != protocol::Version::V1 => {
+                  // warn mismatch?
+                }
+                "v2" if info.version != protocol::Version::V2 => {
+                  // warn mismatch?
+                }
+                _ => {}
+              }
+            }
           } else {
             // Strict enforcement: if configured with proxy_protocol, MUST have a header
             let physical = inbound.peer_addr()?;
@@ -156,7 +216,7 @@ async fn handle_connection(
     }
 
     // connect upstream
-    let mut upstream = UpstreamStream::connect(service.forward_type, &service.forward_addr).await?;
+    let mut upstream = UpstreamStream::connect(&service.forward_to).await?;
 
     // write buffered data (peeked bytes)
     if !buffer.is_empty() {

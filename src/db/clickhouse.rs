@@ -50,11 +50,12 @@ struct TcpLogV6 {
 
 pub struct ClickHouseLogger {
   client: Client,
+  table_base: String,
 }
 
 impl ClickHouseLogger {
-  pub fn new(config: &DatabaseConfig) -> Self {
-    let url = url::Url::parse(&config.dsn).expect("invalid dsn");
+  pub fn new(config: &DatabaseConfig) -> anyhow::Result<Self> {
+    let url = url::Url::parse(&config.dsn).map_err(|e| anyhow::anyhow!("invalid dsn: {}", e))?;
     let mut client = Client::default().with_url(url.as_str());
 
     if let (Some(u), Some(p)) = (Some(url.username()), url.password()) {
@@ -73,12 +74,25 @@ impl ClickHouseLogger {
       }
     }
 
-    Self { client }
+    // Config table name, default to "tcp_log" if missing
+    // We expect config.tables to contain "tcp" -> "tablename"
+    let table_base = config
+      .tables
+      .get("tcp")
+      .cloned()
+      .unwrap_or_else(|| "tcp_log".to_string());
+
+    Ok(Self { client, table_base })
   }
 
   pub async fn init(&self) -> anyhow::Result<()> {
-    let sql_v4 = r#"
-      CREATE TABLE IF NOT EXISTS tcp_log_v4 (
+    let table_v4 = format!("{}_v4", self.table_base);
+    let table_v6 = format!("{}_v6", self.table_base);
+    let view_name = &self.table_base;
+
+    let sql_v4 = format!(
+      r#"
+      CREATE TABLE IF NOT EXISTS {} (
           service     LowCardinality(String),
           conn_ts     DateTime('UTC'),
           duration    UInt32,
@@ -88,10 +102,13 @@ impl ClickHouseLogger {
           bytes       UInt64
       ) ENGINE = MergeTree() 
       ORDER BY (service, conn_ts);
-      "#;
+      "#,
+      table_v4
+    );
 
-    let sql_v6 = r#"
-      CREATE TABLE IF NOT EXISTS tcp_log_v6 (
+    let sql_v6 = format!(
+      r#"
+      CREATE TABLE IF NOT EXISTS {} (
           service     LowCardinality(String),
           conn_ts     DateTime('UTC'),
           duration    UInt32,
@@ -101,30 +118,35 @@ impl ClickHouseLogger {
           bytes       UInt64
       ) ENGINE = MergeTree() 
       ORDER BY (service, conn_ts);
-      "#;
+      "#,
+      table_v6
+    );
 
-    let drop_view = "DROP VIEW IF EXISTS tcp_log";
+    let drop_view = format!("DROP VIEW IF EXISTS {}", view_name);
 
-    let sql_view = r#"
-      CREATE VIEW tcp_log AS
+    let sql_view = format!(
+      r#"
+      CREATE VIEW {} AS
       SELECT 
           service, conn_ts, duration, port,
           IPv4NumToString(ip) AS ip_str, 
           proxy_proto,
           formatReadableSize(bytes) AS traffic
-      FROM tcp_log_v4
+      FROM {}
       UNION ALL
       SELECT 
           service, conn_ts, duration, port,
           IPv6NumToString(ip) AS ip_str, 
           proxy_proto,
           formatReadableSize(bytes) AS traffic
-      FROM tcp_log_v6;
-      "#;
+      FROM {};
+      "#,
+      view_name, table_v4, table_v6
+    );
 
     self
       .client
-      .query(sql_v4)
+      .query(&sql_v4)
       .execute()
       .await
       .map_err(|e| anyhow::anyhow!("failed to create v4 table: {}", e))?;
@@ -132,57 +154,75 @@ impl ClickHouseLogger {
     // Migrations
     let _ = self
       .client
-      .query("ALTER TABLE tcp_log_v4 RENAME COLUMN IF EXISTS bytes_transferred TO bytes")
+      .query(&format!(
+        "ALTER TABLE {} RENAME COLUMN IF EXISTS bytes_transferred TO bytes",
+        table_v4
+      ))
       .execute()
       .await;
     let _ = self
       .client
-      .query("ALTER TABLE tcp_log_v4 RENAME COLUMN IF EXISTS traffic TO bytes")
+      .query(&format!(
+        "ALTER TABLE {} RENAME COLUMN IF EXISTS traffic TO bytes",
+        table_v4
+      ))
       .execute()
       .await;
     let _ = self
       .client
-      .query("ALTER TABLE tcp_log_v4 ADD COLUMN IF NOT EXISTS bytes UInt64")
+      .query(&format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS bytes UInt64",
+        table_v4
+      ))
       .execute()
       .await;
 
     self
       .client
-      .query(sql_v6)
+      .query(&sql_v6)
       .execute()
       .await
       .map_err(|e| anyhow::anyhow!("failed to create v6 table: {}", e))?;
 
     let _ = self
       .client
-      .query("ALTER TABLE tcp_log_v6 RENAME COLUMN IF EXISTS bytes_transferred TO bytes")
+      .query(&format!(
+        "ALTER TABLE {} RENAME COLUMN IF EXISTS bytes_transferred TO bytes",
+        table_v6
+      ))
       .execute()
       .await;
     let _ = self
       .client
-      .query("ALTER TABLE tcp_log_v6 RENAME COLUMN IF EXISTS traffic TO bytes")
+      .query(&format!(
+        "ALTER TABLE {} RENAME COLUMN IF EXISTS traffic TO bytes",
+        table_v6
+      ))
       .execute()
       .await;
     let _ = self
       .client
-      .query("ALTER TABLE tcp_log_v6 ADD COLUMN IF NOT EXISTS bytes UInt64")
+      .query(&format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS bytes UInt64",
+        table_v6
+      ))
       .execute()
       .await;
 
     self
       .client
-      .query(drop_view)
+      .query(&drop_view)
       .execute()
       .await
       .map_err(|e| anyhow::anyhow!("failed to drop view: {}", e))?;
     self
       .client
-      .query(sql_view)
+      .query(&sql_view)
       .execute()
       .await
       .map_err(|e| anyhow::anyhow!("failed to create view: {}", e))?;
 
-    info!("ensured tables and view exist");
+    info!("connected to database");
     Ok(())
   }
 
@@ -198,7 +238,8 @@ impl ClickHouseLogger {
           proxy_proto: log.proxy_proto,
           bytes: log.bytes,
         };
-        let mut insert = self.client.insert("tcp_log_v4")?;
+        let table = format!("{}_v4", self.table_base);
+        let mut insert = self.client.insert(&table)?;
         insert.write(&row).await?;
         insert.end().await?;
       }
@@ -212,7 +253,8 @@ impl ClickHouseLogger {
           proxy_proto: log.proxy_proto,
           bytes: log.bytes,
         };
-        let mut insert = self.client.insert("tcp_log_v6")?;
+        let table = format!("{}_v6", self.table_base);
+        let mut insert = self.client.insert(&table)?;
         insert.write(&row).await?;
         insert.end().await?;
       }

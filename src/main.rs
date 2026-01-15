@@ -17,14 +17,23 @@ fn print_help() {
   println!();
   println!("options:");
   println!("  -f <config_file>  path to the yaml configuration file");
+  println!("  -t, --test        test configuration and exit");
   println!("  -h, --help        print this help message");
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+  tracing_subscriber::fmt()
+    .with_target(false)
+    .with_thread_ids(false)
+    .with_file(false)
+    .with_line_number(false)
+    .init();
+
   let args: Vec<String> = env::args().collect();
 
   let mut config_path = None;
+  let mut test_config = false;
 
   let mut i = 1;
   while i < args.len() {
@@ -36,6 +45,10 @@ async fn main() -> anyhow::Result<()> {
         } else {
           bail!("missing value for -f");
         }
+      }
+      "-t" | "--test" => {
+        test_config = true;
+        i += 1;
       }
       "-h" | "--help" => {
         print_help();
@@ -51,7 +64,8 @@ async fn main() -> anyhow::Result<()> {
     Some(p) => {
       let path = Path::new(&p);
       if !path.exists() {
-        bail!("config file '{}' not found", p);
+        error!("config file '{}' not found", p);
+        std::process::exit(1);
       }
       std::fs::canonicalize(path)?
     }
@@ -61,21 +75,30 @@ async fn main() -> anyhow::Result<()> {
     }
   };
 
-  tracing_subscriber::fmt()
-    .with_target(false)
-    .with_thread_ids(false)
-    .with_file(false)
-    .with_line_number(false)
-    .init();
-
   info!("loading config from {}", config_path.display());
 
-  let config = Config::load(&config_path).await.map_err(|e| {
-    error!("failed to load config: {}", e);
-    e
-  })?;
+  let config = match Config::load(&config_path).await {
+    Ok(c) => c,
+    Err(e) => {
+      error!("failed to load config: {}", e);
+      std::process::exit(1);
+    }
+  };
 
-  core::server::run(config).await?;
+  if test_config {
+    // Validate database config
+    if let Err(e) = crate::db::clickhouse::ClickHouseLogger::new(&config.database) {
+      error!("configuration check failed: {}", e);
+      std::process::exit(1);
+    }
+
+    info!("configuration ok");
+    return Ok(());
+  }
+
+  if let Err(_e) = core::server::run(config).await {
+    std::process::exit(1);
+  }
 
   Ok(())
 }
