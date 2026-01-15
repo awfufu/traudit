@@ -19,19 +19,19 @@ traudit 是一个支持 TCP/UDP/Unix Socket 的反向代理程序，专注于连
 
 ## TODO List
 
-- [ ] 核心功能
-    - [ ] 配置文件解析 (`serde_yaml`)
-    - [ ] 监听器抽象 (TCP/UDP/Unix)
-    - [ ] Proxy Protocol 解析与处理
-    - [ ] 零拷贝转发循环 (`splice`)
+- [x] 核心功能
+    - [x] 配置文件解析 (`serde_yaml`)
+    - [x] 监听器抽象 (TCP/UDP/Unix)
+    - [x] Proxy Protocol 解析与处理
+    - [x] 零拷贝转发循环 (`splice`)
 - [ ] 数据库
     - [ ] 定义审计日志结构
     - [ ] 实现 `AuditLogger` Trait
     - [ ] ClickHouse 适配器
     - [ ] SQLite/MySQL 适配器
-- [ ] 测试
+- [x] 测试
     - [ ] 单元测试 (配置与协议)
-    - [ ] 端到端转发测试
+    - [x] 端到端转发测试
 - [ ] 文档
     - [ ] 详细配置指南
     - [ ] 部署文档

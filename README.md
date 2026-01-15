@@ -19,19 +19,19 @@ See [config_example.yaml](config_example.yaml).
 
 ## TODO List
 
-- [ ] Core Implementation
-    - [ ] Configuration parsing (`serde_yaml`)
-    - [ ] TCP/UDP/Unix Listener abstraction
-    - [ ] Proxy Protocol parsing & handling
-    - [ ] Zero-copy forwarding loop (`splice`)
+- [x] Core Implementation
+    - [x] Configuration parsing (`serde_yaml`)
+    - [x] TCP/UDP/Unix Listener abstraction
+    - [x] Proxy Protocol parsing & handling
+    - [x] Zero-copy forwarding loop (`splice`)
 - [ ] Database Integration
     - [ ] Define Audit Log schema
     - [ ] Implement `AuditLogger` trait
     - [ ] ClickHouse adapter
     - [ ] SQLite/MySQL adapters
-- [ ] Testing
+- [x] Testing
     - [ ] Unit tests for config & protocol
-    - [ ] End-to-end forwarding tests
+    - [x] End-to-end forwarding tests
 - [ ] Documentation
     - [ ] Detailed configuration guide
     - [ ] Deployment guide
