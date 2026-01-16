@@ -48,23 +48,18 @@ struct TcpLogNew {
 
 pub struct ClickHouseLogger {
   client: Client,
-  db_name: String,
 }
 
 impl ClickHouseLogger {
   pub fn new(config: &DatabaseConfig) -> anyhow::Result<Self> {
     let mut url =
       url::Url::parse(&config.dsn).map_err(|e| anyhow::anyhow!("invalid dsn: {}", e))?;
-    let mut db_name = "default".to_string();
-
-    // specific handling for extracting database from path
-    if let Some(path_segments) = url.path_segments().map(|c| c.collect::<Vec<_>>()) {
-      if let Some(db) = path_segments.first() {
-        if !db.is_empty() {
-          db_name = db.to_string();
-        }
-      }
-    }
+    let db_name = url
+      .path_segments()
+      .and_then(|mut segments| segments.next())
+      .filter(|db| !db.is_empty())
+      .ok_or_else(|| anyhow::anyhow!("database name is required in dsn"))?
+      .to_string();
 
     // Clear path from URL so client doesn't append it to requests
     url.set_path("");
@@ -79,22 +74,12 @@ impl ClickHouseLogger {
       client = client.with_user(url.username());
     }
 
-    if !db_name.is_empty() && db_name != "default" {
-      client = client.with_database(&db_name);
-    }
+    client = client.with_database(&db_name);
 
-    Ok(Self { client, db_name })
+    Ok(Self { client })
   }
 
   pub async fn init(&self) -> anyhow::Result<()> {
-    // Ensure database exists. Use 'default' database context to execute CREATE DATABASE.
-    let sys_client = self.client.clone().with_database("default");
-    sys_client
-      .query(&format!("CREATE DATABASE IF NOT EXISTS {}", self.db_name))
-      .execute()
-      .await
-      .map_err(|e| anyhow::anyhow!("failed to create database: {}", e))?;
-
     // Check migrations
     self.check_migrations().await?;
 
