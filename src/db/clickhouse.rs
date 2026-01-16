@@ -226,7 +226,7 @@ impl ClickHouseLogger {
       bytes: log.bytes,
     };
 
-    let mut insert = self.client.insert("tcp_log")?;
+    let mut insert = self.client.insert::<TcpLogNew>("tcp_log").await?;
     insert.write(&row).await?;
     insert.end().await?;
 

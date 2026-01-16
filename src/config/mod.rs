@@ -34,6 +34,7 @@ fn default_timeout_secs() -> u64 {
 pub struct ServiceConfig {
   pub name: String,
   #[serde(rename = "type")]
+  #[allow(dead_code)]
   pub service_type: String,
   pub binds: Vec<BindEntry>,
   #[serde(rename = "forward_to")]

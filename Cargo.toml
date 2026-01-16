@@ -9,10 +9,10 @@ repository = "https://github.com/awfufu/traudit"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-clickhouse = { version = "0.13", features = ["time"] }
+clickhouse = { version = "0.14", features = ["time"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-socket2 = "0.5"
+socket2 = "0.6"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
