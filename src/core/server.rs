@@ -371,11 +371,18 @@ async fn handle_connection(
           buffer = buf;
           if let Some(info) = proxy_info {
             let physical = inbound.peer_addr_string()?;
-            // INFO [ssh] unix://./test.sock <- 192.168.1.1:12345 (unix_socket)
-            // Or INFO [ssh] 0.0.0.0:2222 <- 1.2.3.4:5678 (1.2.3.4:5678)
+
+            // Format: [ssh] unix://test.sock <- RealIP:Port (local)
+            // or [ssh] 0.0.0.0:2222 <- RealIP:Port (1.2.3.4:5678)
+            let physical_fmt = if matches!(inbound, InboundStream::Unix(_)) {
+              "local".to_string()
+            } else {
+              physical
+            };
+
             info!(
               "[{}] {} <- {} ({})",
-              service.name, listen_addr, info.source, physical
+              service.name, listen_addr, info.source, physical_fmt
             );
             final_ip = info.source.ip();
             final_port = info.source.port();
@@ -416,11 +423,8 @@ async fn handle_connection(
       }
     } else {
       let addr = if matches!(inbound, InboundStream::Unix(_)) {
-        // If Unix socket without proxy, display 127.0.0.1:0 as per logic or ...
-        // User requested: unix://... <- 127.0.0.1:port
-        // But inbound.peer_addr_string() for unix is "unix_socket"
-        // And we set final_ip to 127.0.0.1, final_port to 0
-        format!("{}:{}", final_ip, final_port)
+        // [ssh] unix://test.sock <- local
+        "local".to_string()
       } else {
         inbound.peer_addr_string()?
       };

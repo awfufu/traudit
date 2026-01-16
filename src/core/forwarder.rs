@@ -59,8 +59,16 @@ pub async fn zero_copy_bidirectional(
 ) -> (u64, io::Result<()>) {
   // We own the streams now, so we can split references to them for the join.
   let ((c2s_bytes, c2s_res), (s2c_bytes, s2c_res)) = tokio::join!(
-    splice_loop(&inbound, &outbound),
-    splice_loop(&outbound, &inbound)
+    async {
+      let res = splice_loop(&inbound, &outbound).await;
+      let _ = outbound.shutdown_write();
+      res
+    },
+    async {
+      let res = splice_loop(&outbound, &inbound).await;
+      let _ = inbound.shutdown_write();
+      res
+    }
   );
 
   let total = c2s_bytes + s2c_bytes;

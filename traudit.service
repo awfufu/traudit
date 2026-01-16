@@ -1,9 +1,11 @@
 [Unit]
-Description=Traudit Reverse Proxy
+Description=Traudit Reverse Proxy (https://github.com/awfufu/traudit)
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
+RuntimeDirectory=traudit
+WorkingDirectory=/run/traudit
 ExecStart=/usr/bin/traudit -f /etc/traudit/config.yaml
 Restart=on-failure
 RestartSec=5s

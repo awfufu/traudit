@@ -16,6 +16,9 @@ impl UpstreamStream {
     if addr.starts_with('/') {
       let stream = UnixStream::connect(addr).await?;
       Ok(UpstreamStream::Unix(stream))
+    } else if let Some(path) = addr.strip_prefix("unix://") {
+      let stream = UnixStream::connect(path).await?;
+      Ok(UpstreamStream::Unix(stream))
     } else {
       let stream = TcpStream::connect(addr).await?;
       stream.set_nodelay(true)?;
@@ -121,6 +124,13 @@ impl AsyncStream {
       AsyncStream::Unix(fd) => perform_splice_write(fd, pipe_in, len).await,
     }
   }
+
+  pub fn shutdown_write(&self) -> io::Result<()> {
+    match self {
+      AsyncStream::Tcp(fd) => fd.get_ref().shutdown(std::net::Shutdown::Write),
+      AsyncStream::Unix(fd) => fd.get_ref().shutdown(std::net::Shutdown::Write),
+    }
+  }
 }
 
 async fn perform_splice_read<T: AsRawFd>(
@@ -176,5 +186,51 @@ async fn perform_splice_write<T: AsRawFd>(
       Ok(res) => return res,
       Err(_would_block) => continue,
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use tempfile::tempdir;
+  use tokio::net::UnixListener;
+
+  #[tokio::test]
+  async fn test_connect_unix_scheme() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("test_scheme.sock");
+    let socket_path_str = socket_path.to_str().unwrap();
+
+    // Start a listener
+    let _listener = UnixListener::bind(&socket_path).unwrap();
+
+    // Test unix:// path
+    let addr = format!("unix://{}", socket_path_str);
+    let stream = UpstreamStream::connect(&addr).await;
+    assert!(
+      stream.is_ok(),
+      "Failed to connect to unix socket with unix:// prefix: {:?}",
+      stream.err()
+    );
+    assert!(matches!(stream.unwrap(), UpstreamStream::Unix(_)));
+  }
+
+  #[tokio::test]
+  async fn test_connect_unix_absolute_path() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("test_abs.sock");
+    let socket_path_str = socket_path.to_str().unwrap();
+
+    // Start a listener
+    let _listener = UnixListener::bind(&socket_path).unwrap();
+
+    // Test absolute path (legacy support)
+    let stream = UpstreamStream::connect(socket_path_str).await;
+    assert!(
+      stream.is_ok(),
+      "Failed to connect to unix socket with absolute path: {:?}",
+      stream.err()
+    );
+    assert!(matches!(stream.unwrap(), UpstreamStream::Unix(_)));
   }
 }
