@@ -102,6 +102,12 @@ impl AsyncStream {
     Ok(AsyncStream::Tcp(tokio::io::unix::AsyncFd::new(std)?))
   }
 
+  pub fn from_tokio_unix(stream: tokio::net::UnixStream) -> io::Result<Self> {
+    let std = stream.into_std()?;
+    std.set_nonblocking(true)?;
+    Ok(AsyncStream::Unix(tokio::io::unix::AsyncFd::new(std)?))
+  }
+
   pub async fn splice_read(&self, pipe_out: RawFd, len: usize) -> io::Result<usize> {
     match self {
       AsyncStream::Tcp(fd) => perform_splice_read(fd, pipe_out, len).await,

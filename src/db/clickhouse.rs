@@ -3,9 +3,9 @@ use clickhouse::{Client, Row};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::net::{IpAddr, Ipv6Addr};
-use tracing::info;
+use tracing::{error, info};
 
-#[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr)]
+#[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr, PartialEq)]
 #[repr(u8)]
 pub enum ProxyProto {
   None = 0,
@@ -13,49 +13,62 @@ pub enum ProxyProto {
   V2 = 2,
 }
 
+#[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum AddrFamily {
+  Unix = 1,
+  Ipv4 = 2,
+  Ipv6 = 10,
+}
+
 #[derive(Debug, Clone)]
 pub struct TcpLog {
   pub service: String,
   pub conn_ts: time::OffsetDateTime,
   pub duration: u32,
-  pub port: u16,
+  pub addr_family: AddrFamily,
   pub ip: IpAddr,
+  pub port: u16,
   pub proxy_proto: ProxyProto,
   pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
-struct TcpLogV4 {
+struct TcpLogNew {
   pub service: String,
-  #[serde(with = "clickhouse::serde::time::datetime")]
+  #[serde(with = "clickhouse::serde::time::datetime64::millis")]
   pub conn_ts: time::OffsetDateTime,
   pub duration: u32,
-  pub port: u16,
-  pub ip: u32,
-  pub proxy_proto: ProxyProto,
-  pub bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Row)]
-struct TcpLogV6 {
-  pub service: String,
-  #[serde(with = "clickhouse::serde::time::datetime")]
-  pub conn_ts: time::OffsetDateTime,
-  pub duration: u32,
-  pub port: u16,
+  pub addr_family: AddrFamily,
   pub ip: Ipv6Addr,
+  pub port: u16,
   pub proxy_proto: ProxyProto,
   pub bytes: u64,
 }
 
 pub struct ClickHouseLogger {
   client: Client,
-  table_base: String,
+  db_name: String,
 }
 
 impl ClickHouseLogger {
   pub fn new(config: &DatabaseConfig) -> anyhow::Result<Self> {
-    let url = url::Url::parse(&config.dsn).map_err(|e| anyhow::anyhow!("invalid dsn: {}", e))?;
+    let mut url =
+      url::Url::parse(&config.dsn).map_err(|e| anyhow::anyhow!("invalid dsn: {}", e))?;
+    let mut db_name = "default".to_string();
+
+    // specific handling for extracting database from path
+    if let Some(path_segments) = url.path_segments().map(|c| c.collect::<Vec<_>>()) {
+      if let Some(db) = path_segments.first() {
+        if !db.is_empty() {
+          db_name = db.to_string();
+        }
+      }
+    }
+
+    // Clear path from URL so client doesn't append it to requests
+    url.set_path("");
+
     let mut client = Client::default().with_url(url.as_str());
 
     if let (Some(u), Some(p)) = (Some(url.username()), url.password()) {
@@ -66,165 +79,172 @@ impl ClickHouseLogger {
       client = client.with_user(url.username());
     }
 
-    if let Some(path) = url.path_segments().map(|c| c.collect::<Vec<_>>()) {
-      if let Some(db) = path.first() {
-        if !db.is_empty() {
-          client = client.with_database(*db);
-        }
-      }
+    if !db_name.is_empty() && db_name != "default" {
+      client = client.with_database(&db_name);
     }
 
-    // Config table name, default to "tcp_log" if missing
-    // We expect config.tables to contain "tcp" -> "tablename"
-    let table_base = config
-      .tables
-      .get("tcp")
-      .cloned()
-      .unwrap_or_else(|| "tcp_log".to_string());
-
-    Ok(Self { client, table_base })
+    Ok(Self { client, db_name })
   }
 
   pub async fn init(&self) -> anyhow::Result<()> {
-    let table_v4 = format!("{}_v4", self.table_base);
-    let table_v6 = format!("{}_v6", self.table_base);
-    let view_name = &self.table_base;
-
-    let sql_v4 = format!(
-      r#"
-      CREATE TABLE IF NOT EXISTS {} (
-          service     LowCardinality(String),
-          conn_ts     DateTime('UTC'),
-          duration    UInt32,
-          port        UInt16,
-          ip          IPv4,
-          proxy_proto Enum8('None' = 0, 'V1' = 1, 'V2' = 2),
-          bytes       UInt64
-      ) ENGINE = MergeTree() 
-      ORDER BY (service, conn_ts);
-      "#,
-      table_v4
-    );
-
-    let sql_v6 = format!(
-      r#"
-      CREATE TABLE IF NOT EXISTS {} (
-          service     LowCardinality(String),
-          conn_ts     DateTime('UTC'),
-          duration    UInt32,
-          port        UInt16,
-          ip          IPv6,
-          proxy_proto Enum8('None' = 0, 'V1' = 1, 'V2' = 2),
-          bytes       UInt64
-      ) ENGINE = MergeTree() 
-      ORDER BY (service, conn_ts);
-      "#,
-      table_v6
-    );
-
-    let sql_view = format!(
-      r#"
-      CREATE VIEW IF NOT EXISTS {} AS
-      SELECT 
-          service, conn_ts, duration, port,
-          IPv4NumToString(ip) AS ip_str, 
-          proxy_proto,
-          formatReadableSize(bytes) AS traffic
-      FROM {}
-      UNION ALL
-      SELECT 
-          service, conn_ts, duration, port,
-          IPv6NumToString(ip) AS ip_str, 
-          proxy_proto,
-          formatReadableSize(bytes) AS traffic
-      FROM {};
-      "#,
-      view_name, table_v4, table_v6
-    );
-
-    self
-      .client
-      .query(&sql_v4)
+    // Ensure database exists. Use 'default' database context to execute CREATE DATABASE.
+    let sys_client = self.client.clone().with_database("default");
+    sys_client
+      .query(&format!("CREATE DATABASE IF NOT EXISTS {}", self.db_name))
       .execute()
       .await
-      .map_err(|e| anyhow::anyhow!("failed to create v4 table: {}", e))?;
+      .map_err(|e| anyhow::anyhow!("failed to create database: {}", e))?;
 
-    self
-      .client
-      .query(&sql_v6)
-      .execute()
-      .await
-      .map_err(|e| anyhow::anyhow!("failed to create v6 table: {}", e))?;
-
-    // Schema Check / Migration
-    for (table, is_v6) in [(&table_v4, false), (&table_v6, true)] {
-      let ip_type = if is_v6 { "IPv6" } else { "IPv4" };
-      let columns = [
-        ("service", "LowCardinality(String)"),
-        ("conn_ts", "DateTime('UTC')"),
-        ("duration", "UInt32"),
-        ("port", "UInt16"),
-        ("ip", ip_type),
-        ("proxy_proto", "Enum8('None' = 0, 'V1' = 1, 'V2' = 2)"),
-        ("bytes", "UInt64"),
-      ];
-      for (name, type_def) in columns {
-        self
-          .client
-          .query(&format!(
-            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}",
-            table, name, type_def
-          ))
-          .execute()
-          .await
-          .map_err(|e| anyhow::anyhow!("failed to add column {} to {}: {}", name, table, e))?;
-      }
-    }
-
-    self
-      .client
-      .query(&sql_view)
-      .execute()
-      .await
-      .map_err(|e| anyhow::anyhow!("failed to create view: {}", e))?;
+    // Check migrations
+    self.check_migrations().await?;
 
     info!("connected to database");
     Ok(())
   }
 
-  pub async fn insert_log(&self, log: TcpLog) -> anyhow::Result<()> {
-    match log.ip {
-      IpAddr::V4(ip) => {
-        let row = TcpLogV4 {
-          service: log.service,
-          conn_ts: log.conn_ts,
-          duration: log.duration,
-          port: log.port,
-          ip: u32::from(ip),
-          proxy_proto: log.proxy_proto,
-          bytes: log.bytes,
-        };
-        let table = format!("{}_v4", self.table_base);
-        let mut insert = self.client.insert(&table)?;
-        insert.write(&row).await?;
-        insert.end().await?;
-      }
-      IpAddr::V6(ip) => {
-        let row = TcpLogV6 {
-          service: log.service,
-          conn_ts: log.conn_ts,
-          duration: log.duration,
-          port: log.port,
-          ip,
-          proxy_proto: log.proxy_proto,
-          bytes: log.bytes,
-        };
-        let table = format!("{}_v6", self.table_base);
-        let mut insert = self.client.insert(&table)?;
-        insert.write(&row).await?;
-        insert.end().await?;
-      }
+  async fn check_migrations(&self) -> anyhow::Result<()> {
+    // Create migrations table
+    self
+      .client
+      .query(
+        "
+      CREATE TABLE IF NOT EXISTS db_migrations (
+        version String,
+        success UInt8,
+        apply_ts DateTime64 DEFAULT now()
+      ) ENGINE = ReplacingMergeTree(apply_ts)
+      ORDER BY version
+    ",
+      )
+      .execute()
+      .await
+      .map_err(|e| anyhow::anyhow!("failed to create migrations table: {}", e))?;
+
+    // Get current DB version
+    #[derive(Row, Deserialize)]
+    struct MigrationRow {
+      version: String,
+      success: u8,
     }
+
+    let last_migration = self
+      .client
+      .query("SELECT version, success FROM db_migrations ORDER BY apply_ts DESC LIMIT 1")
+      .fetch_optional::<MigrationRow>()
+      .await
+      .map_err(|e| anyhow::anyhow!("failed to fetch last migration: {}", e))?;
+
+    let (current_db_version, success) = last_migration
+      .map(|r| (r.version, r.success == 1))
+      .unwrap_or_else(|| ("v0.0.0".to_string(), true));
+
+    if current_db_version == crate::VERSION && success {
+      return Ok(());
+    }
+
+    if !success {
+      error!(
+        "previous migration to {} failed. retrying...",
+        current_db_version
+      );
+    } else {
+      info!(
+        "migrating database from {} to {}",
+        current_db_version,
+        crate::VERSION
+      );
+    }
+    self.run_migrations(&current_db_version, success).await?;
+
+    Ok(())
+  }
+
+  async fn run_migrations(&self, from_version: &str, last_success: bool) -> anyhow::Result<()> {
+    if from_version < "v0.0.1" || (from_version == "v0.0.1" && !last_success) {
+      info!("applying migration v0.0.1...");
+      if let Err(e) = self.apply_v0_0_1().await {
+        error!("migration v0.0.1 failed: {}", e);
+        // Record failure
+        let _ = self
+          .client
+          .query("INSERT INTO db_migrations (version, success) VALUES (?, 0)")
+          .bind(crate::VERSION)
+          .execute()
+          .await;
+        return Err(e);
+      }
+      // Record success
+      self
+        .client
+        .query("INSERT INTO db_migrations (version, success) VALUES (?, 1)")
+        .bind(crate::VERSION)
+        .execute()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to record migration success: {}", e))?;
+      info!("migration v0.0.1 applied successfully");
+    }
+    Ok(())
+  }
+
+  async fn apply_v0_0_1(&self) -> anyhow::Result<()> {
+    // 1. Create table (tcp_log)
+    let sql_create = r#"
+    CREATE TABLE IF NOT EXISTS tcp_log (
+        service     LowCardinality(String),
+        conn_ts     DateTime64(3),
+        duration    UInt32,
+        addr_family Enum8('unix'=1, 'ipv4'=2, 'ipv6'=10),
+        ip          IPv6,
+        port        UInt16,
+        proxy_proto Enum8('None' = 0, 'V1' = 1, 'V2' = 2),
+        bytes       UInt64
+    ) ENGINE = MergeTree() 
+    ORDER BY (service, conn_ts);
+    "#;
+    self.client.query(sql_create).execute().await?;
+
+    // 2. Create View
+    let sql_view_refined = r#"
+      CREATE VIEW IF NOT EXISTS tcp_log_view AS
+      SELECT 
+          service, conn_ts, duration, addr_family,
+          multiIf(
+            addr_family = 1, 'unix socket',
+            addr_family = 2, IPv4NumToString(toIPv4(ip)),
+            IPv6NumToString(ip)
+          ) as ip_str,
+          port,
+          proxy_proto,
+          formatReadableSize(bytes) AS traffic
+      FROM tcp_log
+      "#;
+
+    self.client.query(sql_view_refined).execute().await?;
+
+    Ok(())
+  }
+
+  pub async fn insert_log(&self, log: TcpLog) -> anyhow::Result<()> {
+    let ipv6 = match log.ip {
+      IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+      IpAddr::V6(ip) => ip,
+    };
+
+    let row = TcpLogNew {
+      service: log.service,
+      conn_ts: log.conn_ts,
+      duration: log.duration,
+      addr_family: log.addr_family,
+      ip: ipv6,
+      port: log.port,
+      proxy_proto: log.proxy_proto,
+      bytes: log.bytes,
+    };
+
+    let mut insert = self.client.insert("tcp_log")?;
+    insert.write(&row).await?;
+    insert.end().await?;
+
     Ok(())
   }
 }

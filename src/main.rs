@@ -9,6 +9,8 @@ use std::env;
 use std::path::Path;
 use tracing::{error, info};
 
+pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
 fn print_help() {
   println!("traudit - a reverse proxy with auditing capabilities");
   println!();
@@ -18,6 +20,7 @@ fn print_help() {
   println!("options:");
   println!("  -f <config_file>  path to the yaml configuration file");
   println!("  -t, --test        test configuration and exit");
+  println!("  -v, --version     print version");
   println!("  -h, --help        print this help message");
   println!();
   println!("project: https://github.com/awfufu/traudit");
@@ -54,6 +57,10 @@ async fn main() -> anyhow::Result<()> {
       }
       "-h" | "--help" => {
         print_help();
+        return Ok(());
+      }
+      "-v" | "--version" => {
+        println!("{}", VERSION);
         return Ok(());
       }
       _ => {

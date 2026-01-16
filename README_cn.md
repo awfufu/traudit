@@ -24,7 +24,7 @@ traudit 是一个支持 TCP/UDP/Unix Socket 的反向代理程序，专注于连
     - [x] TCP 代理与零拷贝转发 (`splice`)
     - [x] Proxy Protocol V1/V2 解析
     - [ ] UDP 转发 (计划中)
-    - [ ] Unix Socket 转发 (计划中)
+    - [x] Unix Socket 转发
 - [x] 数据库集成
     - [x] ClickHouse 适配器 (原生接口)
     - [x] 流量统计 (字节数)

@@ -2,11 +2,9 @@
 
 database:
   type: clickhouse
-  dsn: "http://user:password@ip:port"
+  dsn: "http://user:password@ip:port/traudit"
   batch_size: 50
   batch_timeout_secs: 5
-  tables:
-    tcp: tcp_log
 
 services:
   # Receives traffic from FRP with v2 Proxy Protocol header, audits it,
@@ -24,9 +22,3 @@ services:
 
     forward_to: "127.0.0.1:22"
 
-  # - name: "web"
-  #   type: "tcp"
-  #   binds:
-  #     - addr: "0.0.0.0:8080"
-        
-  #   forward_to: "/run/nginx/web.sock"

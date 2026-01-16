@@ -24,7 +24,7 @@ See [config_example.yaml](config_example.yaml).
     - [x] TCP Proxy & Zero-copy forwarding (`splice`)
     - [x] Proxy Protocol V1/V2 parsing
     - [ ] UDP Forwarding (Planned)
-    - [ ] Unix Socket Forwarding (Planned)
+    - [x] Unix Socket Forwarding
 - [x] Database Integration
     - [x] ClickHouse Adapter (Native Interface)
     - [x] Traffic Accounting (Bytes/Bandwidth)

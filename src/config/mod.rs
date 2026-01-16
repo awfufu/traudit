@@ -1,5 +1,4 @@
-use serde::Deserialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Deserializer};
 use std::path::Path;
 use tokio::fs;
 
@@ -15,7 +14,6 @@ pub struct DatabaseConfig {
   #[allow(dead_code)]
   pub db_type: String,
   pub dsn: String,
-  pub tables: HashMap<String, String>,
   #[serde(default = "default_batch_size")]
   #[allow(dead_code)]
   pub batch_size: usize,
@@ -47,6 +45,41 @@ pub struct BindEntry {
   pub addr: String,
   #[serde(alias = "proxy_protocol", rename = "proxy")]
   pub proxy: Option<String>,
+  #[serde(default = "default_socket_mode", deserialize_with = "deserialize_mode")]
+  pub mode: u32,
+}
+
+fn default_socket_mode() -> u32 {
+  0o600
+}
+
+fn deserialize_mode<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+  D: Deserializer<'de>,
+{
+  #[derive(Deserialize)]
+  #[serde(untagged)]
+  enum ModeValue {
+    Integer(u32),
+    String(String),
+  }
+
+  let value = ModeValue::deserialize(deserializer)?;
+  match value {
+    ModeValue::Integer(i) => {
+      // If user provides 666, they likely mean octal 0666.
+      // But in YAML `mode: 666` is decimal 666.
+      // The requirement says: "if user wrote integer (e.g. 666), process as octal"
+      // So we interpret the decimal value as a sequence of octal digits.
+      // e.g. decimal 666 -> octal 666 (which is decimal 438)
+      let s = i.to_string();
+      u32::from_str_radix(&s, 8).map_err(serde::de::Error::custom)
+    }
+    ModeValue::String(s) => {
+      // If string, parse as octal
+      u32::from_str_radix(&s, 8).map_err(serde::de::Error::custom)
+    }
+  }
 }
 
 impl Config {
@@ -70,8 +103,6 @@ database:
   dsn: "clickhouse://admin:password@127.0.0.1:8123/audit_db"
   batch_size: 50
   batch_timeout_secs: 5
-  tables:
-    tcp: tcp_log
 
 services:
   - name: "ssh-prod"
@@ -96,5 +127,27 @@ services:
     assert_eq!(config.services[0].binds[0].addr, "0.0.0.0:22222");
     assert_eq!(config.services[0].binds[0].proxy, Some("v2".to_string()));
     assert_eq!(config.services[0].forward_to, "127.0.0.1:22");
+  }
+
+  #[test]
+  fn test_mode_deserialization() {
+    #[derive(Deserialize)]
+    struct TestBind {
+      #[serde(default = "default_socket_mode", deserialize_with = "deserialize_mode")]
+      mode: u32,
+    }
+
+    let yaml_int = "mode: 666";
+    let bind_int: TestBind = serde_yaml::from_str(yaml_int).unwrap();
+    assert_eq!(bind_int.mode, 0o666); // 438 decimal
+
+    let yaml_str = "mode: '600'";
+    let bind_str: TestBind = serde_yaml::from_str(yaml_str).unwrap();
+    assert_eq!(bind_str.mode, 0o600); // 384 decimal
+
+    // Test default
+    let yaml_empty = "{}";
+    let bind_empty: TestBind = serde_yaml::from_str(yaml_empty).unwrap();
+    assert_eq!(bind_empty.mode, 0o600);
   }
 }
