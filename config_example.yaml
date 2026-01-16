@@ -7,18 +7,16 @@ database:
   batch_timeout_secs: 5
 
 services:
-  # Receives traffic from FRP with v2 Proxy Protocol header, audits it,
-  # strips the header, and forwards pure TCP to local SSHD.
+  # receives traffic from frp with v2 proxy protocol header, audits it,
+  # strips the header, and forwards pure tcp to local sshd.
   - name: "ssh"
     type: "tcp"
     binds:
       # Entry 1: Public traffic from FRP
-      - addr: "0.0.0.0:2223"
+      - addr: "unix://test.sock"
         proxy: "v2"
 
       # Entry 2: LAN direct traffic (no Proxy Protocol)
       - addr: "0.0.0.0:2222"
-        # no proxy
 
     forward_to: "127.0.0.1:22"
-

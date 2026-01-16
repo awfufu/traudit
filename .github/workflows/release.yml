@@ -45,8 +45,8 @@ jobs:
       - name: Prepare Packaging Assets
         run: |
           # Move binary to expected location for cargo-deb and cargo-generate-rpm which read Cargo.toml assets
-          mkdir -p target/release
-          cp target/${{ matrix.target }}/release/traudit target/release/traudit
+          mkdir -p target/package_tmp
+          cp target/${{ matrix.target }}/release/traudit target/package_tmp/traudit
 
       - name: Package DEB
         run: |

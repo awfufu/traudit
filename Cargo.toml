@@ -3,7 +3,7 @@ name = "traudit"
 version = "0.0.1"
 edition = "2021"
 authors = ["awfufu"]
-description = "A reverse proxy with auditing capabilities."
+description = "A reverse proxy that streams audit records directly to databases."
 license = "MIT"
 repository = "https://github.com/awfufu/traudit"
 
@@ -38,23 +38,20 @@ strip = true
 maintainer = "awfufu"
 copyright = "2026, awfufu"
 license-file = ["README.md", "4"]
-extended-description = """\
-A reverse proxy with auditing capabilities.
-"""
+extended-description = "A reverse proxy that streams audit records directly to databases"
 depends = "$auto"
 section = "net"
 priority = "optional"
 assets = [
-    ["target/release/traudit", "usr/bin/", "755"],
-    ["config_example.yaml", "etc/traudit/config.yaml", "644"],
+    ["target/package_tmp/traudit", "usr/bin/", "755"],
+    ["config_example.yaml", "etc/traudit/config.yaml", "600"],
     ["traudit.service", "usr/lib/systemd/system/traudit.service", "644"],
 ]
 conf-files = ["/etc/traudit/config.yaml"]
 
-
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/traudit", dest = "/usr/bin/traudit", mode = "755" },
-    { source = "config_example.yaml", dest = "/etc/traudit/config.yaml", mode = "644", config = true },
+    { source = "target/package_tmp/traudit", dest = "/usr/bin/traudit", mode = "755" },
+    { source = "config_example.yaml", dest = "/etc/traudit/config.yaml", mode = "600", config = "noreplace" },
     { source = "traudit.service", dest = "/usr/lib/systemd/system/traudit.service", mode = "644" },
 ]
