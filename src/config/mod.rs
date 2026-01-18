@@ -48,6 +48,13 @@ pub struct BindEntry {
   pub proxy: Option<String>,
   #[serde(default = "default_socket_mode", deserialize_with = "deserialize_mode")]
   pub mode: u32,
+  pub tls: Option<TlsConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TlsConfig {
+  pub cert: String,
+  pub key: Option<String>,
 }
 
 fn default_socket_mode() -> u32 {

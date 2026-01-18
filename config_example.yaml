@@ -20,3 +20,19 @@ services:
       - addr: "0.0.0.0:2222"
 
     forward_to: "127.0.0.1:22"
+
+  - name: "https-web"
+    type: "tcp"
+    binds:
+      - addr: "0.0.0.0:443"
+        tls:
+          cert: "/etc/ssl/certs/site.pem"
+          key: "/etc/ssl/private/site.key"
+      
+      - addr: "0.0.0.0:4433"
+        tls:
+          cert: "/etc/ssl/certs/site.pem"
+          key: "/etc/ssl/private/site.key"
+        proxy: "v2"
+
+    forward_to: "127.0.0.1:8080"

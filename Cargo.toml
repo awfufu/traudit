@@ -1,6 +1,6 @@
 [package]
 name = "traudit"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 authors = ["awfufu"]
 description = "A reverse proxy that streams audit records directly to databases."
@@ -15,7 +15,7 @@ serde_yaml = "0.9"
 socket2 = "0.6"
 libc = "0.2"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1.0"
 thiserror = "2.0"
 bytes = "1.1"
@@ -23,6 +23,7 @@ url = "2.5"
 async-trait = "0.1"
 time = { version = "0.3.45", features = ["serde", "macros", "formatting", "parsing"] }
 serde_repr = "0.1.20"
+pingora = { version = "0.6", features = ["lb", "openssl"] }
 
 [dev-dependencies]
 tempfile = "3"

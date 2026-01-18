@@ -35,22 +35,30 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
   let mut join_set = tokio::task::JoinSet::new();
   let mut socket_guards = Vec::new();
 
+  // Pingora server initialization (TLS only)
+  let mut pingora_services = Vec::new();
+
   for service in config.services {
     let db = db.clone();
-
-    // Only support TCP, skipping others
 
     for bind in &service.binds {
       let service_config = service.clone();
       let bind_addr = bind.addr.clone();
-      // proxy is Option<String>
       let proxy_proto_config = bind.proxy.clone();
       let mode = bind.mode;
 
+      // Check if this bind is TLS/Pingora managed
+      if let Some(tls_config) = &bind.tls {
+        // This is a Pingora service
+        pingora_services.push((service_config, bind.clone(), tls_config.clone()));
+        continue;
+      }
+
+      // Legacy TCP/Unix Logic
       if bind_addr.starts_with("unix://") {
         let path = bind_addr.trim_start_matches("unix://");
 
-        // bind_robust handles cleanup and permission checks
+        // Bind robustly
         let (listener, guard) = bind_robust(path, mode, &service_config.name).await?;
 
         // Push guard to keep it alive
@@ -69,7 +77,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
           bind.addr.clone(),
         ));
       } else {
-        // BindType removed, assume TCP bind
         let listener = TcpListener::bind(&bind_addr).await.map_err(|e| {
           error!(
             "[{}] failed to bind {}: {}",
@@ -102,6 +109,52 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
   }
 
+  // Run Pingora in a separate thread if needed
+  if !pingora_services.is_empty() {
+    info!(
+      "initializing pingora for {} tls services",
+      pingora_services.len()
+    );
+
+    // Spawn Pingora
+    std::thread::spawn(move || {
+      use crate::core::pingora_proxy::TrauditProxy;
+      use pingora::proxy::http_proxy_service;
+      use pingora::server::configuration::Opt;
+      use pingora::server::Server;
+
+      if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut server = Server::new(Some(Opt::default())).unwrap();
+        server.bootstrap();
+
+        for (svc_config, bind, tls) in pingora_services {
+          let proxy = TrauditProxy {
+            db: db.clone(),
+            service_config: svc_config.clone(),
+          };
+
+          let mut service = http_proxy_service(&server.configuration, proxy);
+
+          // Key path fallback
+          let key_path = tls.key.as_deref().unwrap_or(&tls.cert);
+
+          service.add_tls(&bind.addr, &tls.cert, key_path).unwrap();
+
+          info!("[{}] listening on tcp {}", svc_config.name, bind.addr);
+          server.add_service(service);
+        }
+
+        info!("starting pingora server run_forever loop");
+        server.run_forever();
+      })) {
+        error!("pingora server panicked: {:?}", e);
+      }
+      error!("pingora server exited unexpectedly!");
+      error!("pingora server exited unexpectedly!");
+    });
+  }
+
+  // Always wait for signals
   match signal::ctrl_c().await {
     Ok(()) => {
       info!("shutdown signal received.");
