@@ -3,18 +3,10 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UnixStream};
 
+#[derive(Debug)]
 pub enum InboundStream {
   Tcp(TcpStream),
   Unix(UnixStream),
-}
-
-impl InboundStream {
-  pub fn peer_addr_string(&self) -> std::io::Result<String> {
-    match self {
-      InboundStream::Tcp(s) => Ok(s.peer_addr()?.to_string()),
-      InboundStream::Unix(_) => Ok("unix_socket".to_string()),
-    }
-  }
 }
 
 impl AsyncRead for InboundStream {

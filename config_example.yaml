@@ -2,37 +2,43 @@
 
 database:
   type: clickhouse
-  dsn: "http://user:password@ip:port/traudit"
+  # dsn: "http://user:password@ip:port/database"
+  dsn: http://traudit:traudit114514@127.0.0.1:8123/traudit
   batch_size: 50
-  batch_timeout_secs: 5
+  batch_timeout_secs: 100
 
 services:
-  # receives traffic from frp with v2 proxy protocol header, audits it,
-  # strips the header, and forwards pure tcp to local sshd.
+  # Receives traffic from FRP with v2 Proxy Protocol header, audits it,
+  # strips the header, and forwards pure TCP to local SSHD.
   - name: "ssh"
+    forward_to: "127.0.0.1:22"
     type: "tcp"
+    real_ip:
+      from: "proxy_protocol"
+      trust_private_ranges: true
     binds:
       # Entry 1: Public traffic from FRP
-      - addr: "unix://test.sock"
+      - addr: "0.0.0.0:2223"
         proxy: "v2"
+
 
       # Entry 2: LAN direct traffic (no Proxy Protocol)
       - addr: "0.0.0.0:2222"
+        # real_ip:
+        #   strategy: ["proxy_protocol", "remote_addr"] # default
 
-    forward_to: "127.0.0.1:22"
-
-  - name: "https-web"
-    type: "tcp"
-    binds:
-      - addr: "0.0.0.0:443"
-        tls:
-          cert: "/etc/ssl/certs/site.pem"
-          key: "/etc/ssl/private/site.key"
-      
-      - addr: "0.0.0.0:4433"
-        tls:
-          cert: "/etc/ssl/certs/site.pem"
-          key: "/etc/ssl/private/site.key"
-        proxy: "v2"
-
+  - name: "web"
     forward_to: "127.0.0.1:8080"
+    type: "http"
+    binds:
+      - addr: 0.0.0.0:443
+        tls:
+          cert: "/path/to/cert.crt"
+          key: "/path/to/key.key"
+        proxy: v2
+        real_ip:
+          from: "proxy_protocol"
+          trust_private_ranges: true
+          trusted_proxies:
+            - 1.2.3.4
+

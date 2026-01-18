@@ -1,4 +1,5 @@
 use serde::{Deserialize, Deserializer};
+use std::net::IpAddr;
 use std::path::Path;
 use tokio::fs;
 
@@ -42,6 +43,58 @@ pub struct ServiceConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct RealIpConfig {
+  #[serde(default, rename = "from")]
+  pub source: RealIpSource,
+  #[serde(default, deserialize_with = "deserialize_trusted_proxies")]
+  pub trusted_proxies: Vec<ipnet::IpNet>,
+  #[serde(default)]
+  pub trust_private_ranges: bool,
+  #[serde(default)]
+  pub xff_trust_depth: usize,
+}
+
+impl RealIpConfig {
+  pub fn is_trusted(&self, ip: IpAddr) -> bool {
+    // Check explicit trusted proxies
+    for net in &self.trusted_proxies {
+      if net.contains(&ip) {
+        return true;
+      }
+    }
+
+    if self.trust_private_ranges && is_private(&ip) {
+      return true;
+    }
+
+    false
+  }
+}
+
+fn is_private(ip: &IpAddr) -> bool {
+  match ip {
+    IpAddr::V4(addr) => addr.is_loopback() || addr.is_link_local() || addr.is_private(),
+    IpAddr::V6(addr) => {
+      addr.is_loopback() ||
+            // addr.is_unique_local() is unstable, check ranges manually
+            // fc00::/7
+            (addr.segments()[0] & 0xfe00) == 0xfc00 ||
+            // fe80::/10
+            (addr.segments()[0] & 0xffc0) == 0xfe80
+    }
+  }
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RealIpSource {
+  ProxyProtocol,
+  Xff,
+  #[default]
+  RemoteAddr,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct BindEntry {
   pub addr: String,
   #[serde(alias = "proxy_protocol", rename = "proxy")]
@@ -49,6 +102,7 @@ pub struct BindEntry {
   #[serde(default = "default_socket_mode", deserialize_with = "deserialize_mode")]
   pub mode: u32,
   pub tls: Option<TlsConfig>,
+  pub real_ip: Option<RealIpConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -75,11 +129,7 @@ where
   let value = ModeValue::deserialize(deserializer)?;
   match value {
     ModeValue::Integer(i) => {
-      // If user provides 666, they likely mean octal 0666.
-      // But in YAML `mode: 666` is decimal 666.
-      // The requirement says: "if user wrote integer (e.g. 666), process as octal"
-      // So we interpret the decimal value as a sequence of octal digits.
-      // e.g. decimal 666 -> octal 666 (which is decimal 438)
+      // Interpret decimal integer as octal (e.g., 666 -> 0666) per requirements.
       let s = i.to_string();
       u32::from_str_radix(&s, 8).map_err(serde::de::Error::custom)
     }
@@ -88,6 +138,27 @@ where
       u32::from_str_radix(&s, 8).map_err(serde::de::Error::custom)
     }
   }
+}
+
+fn deserialize_trusted_proxies<'de, D>(deserializer: D) -> Result<Vec<ipnet::IpNet>, D::Error>
+where
+  D: Deserializer<'de>,
+{
+  let strings: Vec<String> = Vec::deserialize(deserializer)?;
+  let mut nets = Vec::with_capacity(strings.len());
+  for s in strings {
+    if let Ok(net) = s.parse::<ipnet::IpNet>() {
+      nets.push(net);
+    } else if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+      nets.push(ipnet::IpNet::from(ip));
+    } else {
+      return Err(serde::de::Error::custom(format!(
+        "invalid IP address or CIDR: {}",
+        s
+      )));
+    }
+  }
+  Ok(nets)
 }
 
 impl Config {

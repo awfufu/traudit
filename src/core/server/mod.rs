@@ -1,18 +1,19 @@
-use crate::config::{Config, ServiceConfig};
+use crate::config::Config;
 use crate::core::upstream::UpstreamStream;
 use crate::db::clickhouse::ClickHouseLogger;
-use std::sync::Arc;
-use tokio::net::{TcpListener, UnixListener};
+use pingora::apps::ServerApp;
+use std::os::unix::fs::PermissionsExt;
+use std::sync::{Arc, Barrier};
 use tokio::signal;
 use tracing::{error, info};
 
 mod handler;
 mod listener;
+mod pingora_compat;
 mod stream;
 
 use self::handler::handle_connection;
-use self::listener::bind_robust;
-use self::stream::InboundStream;
+use self::listener::{bind_listener, serve_listener_loop, UnifiedListener};
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
   let db_logger = ClickHouseLogger::new(&config.database).map_err(|e| {
@@ -33,69 +34,198 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
   }
 
   let mut join_set = tokio::task::JoinSet::new();
-  let mut socket_guards = Vec::new();
 
-  // Pingora server initialization (TLS only)
+  // Pingora server initialization (TLS only or Standard HTTP)
   let mut pingora_services = Vec::new();
 
   for service in config.services {
     let db = db.clone();
-
     for bind in &service.binds {
       let service_config = service.clone();
       let bind_addr = bind.addr.clone();
       let proxy_proto_config = bind.proxy.clone();
       let mode = bind.mode;
+      let real_ip_config = bind.real_ip.clone();
 
-      // Check if this bind is TLS/Pingora managed
-      if let Some(tls_config) = &bind.tls {
-        // This is a Pingora service
-        pingora_services.push((service_config, bind.clone(), tls_config.clone()));
+      // Use custom loop for TCP services or HTTP services requiring PROXY protocol parsing (not fully supported by pingora standard loop).
+
+      let is_tcp_service = service.service_type == "tcp";
+      let is_http_proxy =
+        service.service_type == "http" && bind.proxy.is_some() && bind.tls.is_none();
+
+      let use_custom_loop = is_tcp_service || is_http_proxy;
+
+      if !use_custom_loop {
+        // Use Standard Pingora Service (For TLS, or Pure HTTP, or Unix HTTP without PROXY)
+        pingora_services.push((
+          service_config,
+          bind.clone(),
+          bind.tls.clone(),
+          real_ip_config,
+        ));
         continue;
       }
 
-      // Legacy TCP/Unix Logic
-      if bind_addr.starts_with("unix://") {
-        let path = bind_addr.trim_start_matches("unix://");
+      // --- Custom Loop Logic ---
 
-        // Bind robustly
-        let (listener, guard) = bind_robust(path, mode, &service_config.name).await?;
+      let listener_res = bind_listener(&bind_addr, mode, &service_config.name).await;
 
-        // Push guard to keep it alive
-        socket_guards.push(guard);
+      let listener = match listener_res {
+        Ok(l) => l,
+        Err(e) => {
+          return Err(e);
+        }
+      };
 
+      let listen_type = match &listener {
+        UnifiedListener::Unix(_, _) => "unix",
+        UnifiedListener::Tcp(_) => "tcp",
+      };
+
+      if is_http_proxy {
         info!(
-          "[{}] listening on unix {} (mode {:o})",
-          service_config.name, path, mode
+          "[{}] listening on http {} {} (PROXY support)",
+          service_config.name, listen_type, bind_addr
         );
+      } else {
+        info!(
+          "[{}] listening on {} {}",
+          service_config.name, listen_type, bind_addr
+        );
+      }
 
-        join_set.spawn(start_unix_service(
-          service_config,
+      let shutdown_dummy =
+        pingora::server::ShutdownWatch::from(tokio::sync::watch::channel(false).1);
+
+      if is_tcp_service {
+        // --- TCP Handler (with startup check) ---
+        if let Err(e) = UpstreamStream::connect(&service_config.forward_to).await {
+          tracing::warn!(
+            "[{}] -> '{}': startup check failed: {}",
+            service_config.name,
+            service_config.forward_to,
+            e
+          );
+        }
+
+        let db = db.clone();
+        let _proxy_cfg = proxy_proto_config.clone();
+        let listen_addr_log = bind_addr.clone();
+        let svc_cfg = service_config.clone();
+
+        join_set.spawn(serve_listener_loop(
           listener,
+          service_config,
+          real_ip_config,
           proxy_proto_config,
-          db.clone(),
-          bind.addr.clone(),
+          shutdown_dummy,
+          move |stream, info| {
+            let db = db.clone();
+            let svc = svc_cfg.clone();
+            let addr = listen_addr_log.clone();
+            async move {
+              if let Err(e) = handle_connection(stream, info, svc, db, addr).await {
+                match e.kind() {
+                  std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
+                    tracing::debug!("connection closed: {}", e);
+                  }
+                  _ => error!("connection error: {}", e),
+                }
+              }
+            }
+          },
         ));
       } else {
-        let listener = TcpListener::bind(&bind_addr).await.map_err(|e| {
-          error!(
-            "[{}] failed to bind {}: {}",
-            service_config.name, bind_addr, e
-          );
-          e
-        })?;
+        // --- HTTP Proxy Handler ---
+        use crate::core::pingora_proxy::TrauditProxy;
+        use pingora::proxy::http_proxy_service;
 
-        info!("[{}] listening on tcp {}", service_config.name, bind_addr);
+        let conf = Arc::new(pingora::server::configuration::ServerConf::default());
+        let inner_proxy = TrauditProxy {
+          db: db.clone(),
+          service_config: service_config.clone(),
+          listen_addr: bind_addr.clone(),
+          real_ip: real_ip_config.clone(),
+        };
+        let mut service_obj = http_proxy_service(&conf, inner_proxy);
+        let app = unsafe {
+          let app_ptr = service_obj.app_logic_mut().expect("app logic missing");
+          std::ptr::read(app_ptr)
+        };
+        std::mem::forget(service_obj);
+        let app = Arc::new(app);
 
-        join_set.spawn(start_tcp_service(
-          service_config,
+        join_set.spawn(serve_listener_loop(
           listener,
+          service_config,
+          real_ip_config,
           proxy_proto_config,
-          db.clone(),
-          bind.addr.clone(),
+          shutdown_dummy.clone(),
+          move |stream, _info| {
+            let app = app.clone();
+            let shutdown = shutdown_dummy.clone();
+            async move {
+              let stream: pingora::protocols::Stream = Box::new(stream);
+              app.process_new(stream, &shutdown).await;
+            }
+          },
         ));
       }
     }
+  }
+
+  // Run Pingora in a separate thread if needed
+  if !pingora_services.is_empty() {
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_clone = barrier.clone();
+
+    std::thread::spawn(move || {
+      use crate::core::pingora_proxy::TrauditProxy;
+      use pingora::proxy::http_proxy_service;
+      use pingora::server::configuration::Opt;
+      use pingora::server::Server;
+
+      if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut server = Server::new(Some(Opt::default())).unwrap();
+        server.bootstrap();
+
+        for (svc_config, bind, tls, real_ip) in pingora_services {
+          let proxy = TrauditProxy {
+            db: db.clone(),
+            service_config: svc_config.clone(),
+            listen_addr: bind.addr.clone(),
+            real_ip,
+          };
+
+          let mut service = http_proxy_service(&server.configuration, proxy);
+
+          if let Some(tls_config) = tls {
+            let key_path = tls_config.key.as_deref().unwrap_or(&tls_config.cert);
+            service
+              .add_tls(&bind.addr, &tls_config.cert, key_path)
+              .unwrap();
+            info!("[{}] listening on https {}", svc_config.name, bind.addr);
+          } else if bind.addr.starts_with("unix://") {
+            let path = bind.addr.trim_start_matches("unix://");
+            service.add_uds(path, Some(std::fs::Permissions::from_mode(bind.mode)));
+            info!("[{}] listening on http unix {}", svc_config.name, path);
+          } else {
+            service.add_tcp(&bind.addr);
+            info!("[{}] listening on http {}", svc_config.name, bind.addr);
+          }
+
+          server.add_service(service);
+        }
+
+        barrier_clone.wait();
+        server.run_forever();
+      })) {
+        error!("pingora server panicked: {:?}", e);
+      }
+      error!("pingora server exited unexpectedly!");
+    });
+
+    barrier.wait();
   }
 
   info!("traudit started...");
@@ -109,52 +239,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
   }
 
-  // Run Pingora in a separate thread if needed
-  if !pingora_services.is_empty() {
-    info!(
-      "initializing pingora for {} tls services",
-      pingora_services.len()
-    );
-
-    // Spawn Pingora
-    std::thread::spawn(move || {
-      use crate::core::pingora_proxy::TrauditProxy;
-      use pingora::proxy::http_proxy_service;
-      use pingora::server::configuration::Opt;
-      use pingora::server::Server;
-
-      if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut server = Server::new(Some(Opt::default())).unwrap();
-        server.bootstrap();
-
-        for (svc_config, bind, tls) in pingora_services {
-          let proxy = TrauditProxy {
-            db: db.clone(),
-            service_config: svc_config.clone(),
-          };
-
-          let mut service = http_proxy_service(&server.configuration, proxy);
-
-          // Key path fallback
-          let key_path = tls.key.as_deref().unwrap_or(&tls.cert);
-
-          service.add_tls(&bind.addr, &tls.cert, key_path).unwrap();
-
-          info!("[{}] listening on tcp {}", svc_config.name, bind.addr);
-          server.add_service(service);
-        }
-
-        info!("starting pingora server run_forever loop");
-        server.run_forever();
-      })) {
-        error!("pingora server panicked: {:?}", e);
-      }
-      error!("pingora server exited unexpectedly!");
-      error!("pingora server exited unexpectedly!");
-    });
-  }
-
-  // Always wait for signals
   match signal::ctrl_c().await {
     Ok(()) => {
       info!("shutdown signal received.");
@@ -165,139 +249,5 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
   }
 
   join_set.shutdown().await;
-
-  // socket_guards dropped here, cleaning up files
   Ok(())
-}
-
-async fn start_tcp_service(
-  service: ServiceConfig,
-  listener: TcpListener,
-  proxy_cfg: Option<String>,
-  db: Arc<ClickHouseLogger>,
-  listen_addr: String,
-) {
-  // Startup liveness check
-  if let Err(e) = UpstreamStream::connect(&service.forward_to).await {
-    match e.kind() {
-      std::io::ErrorKind::ConnectionRefused => {
-        tracing::warn!("[{}] -> '{}': {}", service.name, service.forward_to, e);
-      }
-      std::io::ErrorKind::NotFound => {
-        tracing::warn!("[{}] -> '{}': {}", service.name, service.forward_to, e);
-      }
-      _ => {
-        // Log other startup errors as warnings
-        tracing::warn!(
-          "[{}] -> '{}': startup check failed: {}",
-          service.name,
-          service.forward_to,
-          e
-        );
-      }
-    }
-  }
-
-  loop {
-    match listener.accept().await {
-      Ok((inbound, _client_addr)) => {
-        let service = service.clone();
-        let db = db.clone();
-        let proxy_cfg = proxy_cfg.clone();
-        let listen_addr = listen_addr.clone();
-
-        tokio::spawn(async move {
-          let svc_name = service.name.clone();
-          let svc_target = service.forward_to.clone();
-          let inbound = InboundStream::Tcp(inbound);
-
-          if let Err(e) = handle_connection(inbound, service, proxy_cfg, db, listen_addr).await {
-            match e.kind() {
-              std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
-                // normal disconnects, debug log only
-                tracing::debug!("connection closed: {}", e);
-              }
-              std::io::ErrorKind::ConnectionRefused => {
-                tracing::warn!("[{}] -> '{}': {}", svc_name, svc_target, e);
-              }
-              std::io::ErrorKind::NotFound => {
-                tracing::warn!("[{}] -> '{}': {}", svc_name, svc_target, e);
-              }
-              _ => {
-                error!("connection error: {}", e);
-              }
-            }
-          }
-        });
-      }
-      Err(e) => {
-        error!("accept error: {}", e);
-      }
-    }
-  }
-}
-
-async fn start_unix_service(
-  service: ServiceConfig,
-  listener: UnixListener,
-  proxy_cfg: Option<String>,
-  db: Arc<ClickHouseLogger>,
-  listen_addr: String,
-) {
-  // Startup liveness check (same as TCP)
-  if let Err(e) = UpstreamStream::connect(&service.forward_to).await {
-    match e.kind() {
-      std::io::ErrorKind::ConnectionRefused => {
-        tracing::warn!("[{}] -> '{}': {}", service.name, service.forward_to, e);
-      }
-      std::io::ErrorKind::NotFound => {
-        tracing::warn!("[{}] -> '{}': {}", service.name, service.forward_to, e);
-      }
-      _ => {
-        tracing::warn!(
-          "[{}] -> '{}': startup check failed: {}",
-          service.name,
-          service.forward_to,
-          e
-        );
-      }
-    }
-  }
-
-  loop {
-    match listener.accept().await {
-      Ok((inbound, _addr)) => {
-        let service = service.clone();
-        let db = db.clone();
-        let proxy_cfg = proxy_cfg.clone();
-        let listen_addr = listen_addr.clone();
-
-        tokio::spawn(async move {
-          let svc_name = service.name.clone();
-          let svc_target = service.forward_to.clone();
-          let inbound = InboundStream::Unix(inbound);
-
-          if let Err(e) = handle_connection(inbound, service, proxy_cfg, db, listen_addr).await {
-            match e.kind() {
-              std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
-                tracing::debug!("connection closed: {}", e);
-              }
-              std::io::ErrorKind::ConnectionRefused => {
-                tracing::warn!("[{}] -> '{}': {}", svc_name, svc_target, e);
-              }
-              std::io::ErrorKind::NotFound => {
-                tracing::warn!("[{}] -> '{}': {}", svc_name, svc_target, e);
-              }
-              _ => {
-                error!("connection error: {}", e);
-              }
-            }
-          }
-        });
-      }
-      Err(e) => {
-        error!("accept error: {}", e);
-      }
-    }
-  }
 }

@@ -1,4 +1,4 @@
-use crate::config::ServiceConfig;
+use crate::config::{RealIpSource, ServiceConfig};
 use crate::db::clickhouse::{ClickHouseLogger, HttpLog, HttpMethod};
 use async_trait::async_trait;
 use pingora::prelude::*;
@@ -9,6 +9,8 @@ use std::time::Instant;
 pub struct TrauditProxy {
   pub db: Arc<ClickHouseLogger>,
   pub service_config: ServiceConfig,
+  pub listen_addr: String,
+  pub real_ip: Option<crate::config::RealIpConfig>,
 }
 
 pub struct HttpContext {
@@ -41,28 +43,129 @@ impl ProxyHttp for TrauditProxy {
   }
 
   async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-    // IP Priority: Proxy Protocol > XFF > X-Real-IP > Peer
-    let mut client_ip: Option<IpAddr> = session
+    ctx.start_ts = Some(Instant::now());
+
+    // 1. Determine Source IP
+    let peer_addr = session
       .client_addr()
       .and_then(|a| a.as_inet())
-      .map(|a| a.ip());
+      .map(|a| a.ip())
+      .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
 
-    // Check headers for overrides
-    if let Some(xff) = session.req_header().headers.get("x-forwarded-for") {
-      if let Ok(xff_str) = xff.to_str() {
-        if let Some(first_ip) = xff_str.split(',').next() {
-          if let Ok(parsed_ip) = first_ip.trim().parse::<IpAddr>() {
-            client_ip = Some(parsed_ip); // Overwrite
+    let mut resolved_ip = peer_addr;
+
+    if let Some(cfg) = &self.real_ip {
+      match cfg.source {
+        RealIpSource::ProxyProtocol => {
+          // If custom listener was used, peer_addr is already the injected Real IP.
+          resolved_ip = peer_addr;
+        }
+        RealIpSource::RemoteAddr => {
+          resolved_ip = peer_addr;
+        }
+        RealIpSource::Xff => {
+          // Check trust on current peer/proxy IP
+          if cfg.is_trusted(peer_addr) {
+            if let Some(xff) = session.req_header().headers.get("x-forwarded-for") {
+              if let Ok(xff_str) = xff.to_str() {
+                let ips: Vec<&str> = xff_str.split(',').map(|s| s.trim()).collect();
+
+                if !ips.is_empty() {
+                  // Recursive trust (0) vs Fixed Depth
+                  if cfg.xff_trust_depth == 0 {
+                    // Recursive: walk backwards until first untrusted
+                    let mut candidate = None;
+                    for ip_str in ips.iter().rev() {
+                      if let Ok(ip) = ip_str.parse() {
+                        if cfg.is_trusted(ip) {
+                          continue;
+                        } else {
+                          candidate = Some(ip);
+                          break;
+                        }
+                      }
+                    }
+                    // If all trusted, take the first one (leftmost)
+                    if let Some(ip) = candidate {
+                      resolved_ip = ip;
+                    } else if let Some(first_str) = ips.first() {
+                      if let Ok(ip) = first_str.parse() {
+                        resolved_ip = ip;
+                      }
+                    }
+                  } else {
+                    // Fixed depth
+                    let idx = if ips.len() >= cfg.xff_trust_depth {
+                      ips.len() - cfg.xff_trust_depth
+                    } else {
+                      0
+                    };
+
+                    if let Some(val) = ips.get(idx) {
+                      if let Ok(ip) = val.parse() {
+                        resolved_ip = ip;
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
     }
 
-    if let Some(ip) = client_ip {
-      ctx.src_ip = ip;
+    ctx.src_ip = resolved_ip;
+
+    // Log connection info
+    let src_fmt = resolved_ip.to_string();
+    let physical_fmt = peer_addr.to_string();
+
+    if src_fmt == physical_fmt {
+      // If we stuck to physical, check if there was an XFF we ignored
+      let xff_msg = if let Some(xff) = session.req_header().headers.get("x-forwarded-for") {
+        if let Ok(v) = xff.to_str() {
+          // Only show if we actually have RealIpConfig that denied us
+          if let Some(cfg) = &self.real_ip {
+            if !cfg.is_trusted(peer_addr) {
+              format!("(untrusted) xff: {}", v)
+            } else {
+              "".to_string()
+            }
+          } else {
+            "".to_string()
+          }
+        } else {
+          "".to_string()
+        }
+      } else {
+        "".to_string()
+      };
+
+      if !xff_msg.is_empty() {
+        tracing::info!(
+          "[{}] {} <- {} {}",
+          self.service_config.name,
+          self.listen_addr,
+          src_fmt,
+          xff_msg
+        );
+      } else {
+        tracing::info!(
+          "[{}] {} <- {}",
+          self.service_config.name,
+          self.listen_addr,
+          src_fmt
+        );
+      }
     } else {
-      // fallback to 0.0.0.0 if entirely missing (unlikely)
-      ctx.src_ip = IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0));
+      tracing::info!(
+        "[{}] {} <- {} ({})",
+        self.service_config.name,
+        self.listen_addr,
+        src_fmt,
+        physical_fmt
+      );
     }
 
     // 2. Audit Info
@@ -137,8 +240,6 @@ impl ProxyHttp for TrauditProxy {
       ctx.status_code = header.status.as_u16();
     }
 
-    // Bytes (resp_body_size accumulated in filter)
-
     ctx.req_body_size = session.body_bytes_read() as u64;
 
     let addr_family = if ctx.src_ip.is_ipv4() {
@@ -166,7 +267,6 @@ impl ProxyHttp for TrauditProxy {
     let db = self.db.clone();
     tokio::spawn(async move {
       if let Err(e) = db.insert_http_log(log).await {
-        // log error
         tracing::error!("failed to insert http log: {}", e);
       }
     });
