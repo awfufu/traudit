@@ -241,23 +241,6 @@ impl ClickHouseLogger {
   async fn run_bootstrap_migration(&self, version: &str) -> anyhow::Result<()> {
     info!("applying bootstrap migration {}...", version);
 
-    // Clean old tables
-    self
-      .client
-      .query("DROP TABLE IF EXISTS tcp_log")
-      .execute()
-      .await?;
-    self
-      .client
-      .query("DROP VIEW IF EXISTS tcp_log_view")
-      .execute()
-      .await?;
-    self
-      .client
-      .query("DROP TABLE IF EXISTS http_log")
-      .execute()
-      .await?;
-
     // 1. Create table (tcp_log)
     let sql_create_tcp = r#"
     CREATE TABLE IF NOT EXISTS tcp_log (
@@ -276,7 +259,7 @@ impl ClickHouseLogger {
 
     // 2. Create View
     let sql_view_tcp = r#"
-      CREATE VIEW IF NOT EXISTS tcp_log_view AS
+      CREATE OR REPLACE VIEW tcp_log_view AS
       SELECT 
           service, conn_ts, duration, addr_family,
           multiIf(
