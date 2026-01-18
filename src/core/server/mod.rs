@@ -7,10 +7,10 @@ use std::sync::{Arc, Barrier};
 use tokio::signal;
 use tracing::{error, info};
 
-mod handler;
+pub mod handler;
 mod listener;
 mod pingora_compat;
-mod stream;
+pub mod stream;
 
 use self::handler::handle_connection;
 use self::listener::{bind_listener, serve_listener_loop, UnifiedListener};

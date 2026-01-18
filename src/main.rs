@@ -1,9 +1,6 @@
-mod config;
-mod core;
-mod db;
-mod protocol;
+use traudit::config::Config;
+use traudit::core;
 
-use crate::config::Config;
 use anyhow::bail;
 use std::env;
 use std::path::Path;
@@ -100,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
 
   if test_config {
     // Validate database config
-    if let Err(e) = crate::db::clickhouse::ClickHouseLogger::new(&config.database) {
+    if let Err(e) = traudit::db::clickhouse::ClickHouseLogger::new(&config.database) {
       error!("configuration check failed: {}", e);
       std::process::exit(1);
     }

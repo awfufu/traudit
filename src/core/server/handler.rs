@@ -144,7 +144,7 @@ pub async fn handle_connection(
   Ok(total_bytes)
 }
 
-pub(crate) async fn resolve_real_ip(
+pub async fn resolve_real_ip(
   config: &Option<RealIpConfig>,
   remote_addr: SocketAddr,
   proxy_info: &Option<ProxyInfo>,
@@ -198,7 +198,7 @@ pub(crate) async fn peek_xff_ip<T: AsyncRead + Unpin>(
   let max_header = 4096;
   loop {
     if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-      let header_bytes = &buffer[..pos];
+      let header_bytes = &buffer[..pos + 4];
       let mut headers = [httparse::Header {
         name: "",
         value: &[],

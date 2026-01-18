@@ -20,12 +20,15 @@ services:
       # Entry 1: Public traffic from FRP
       - addr: "0.0.0.0:2223"
         proxy: "v2"
-
+        real_ip:
+          from: "proxy_protocol"
+          trust_private_ranges: true
 
       # Entry 2: LAN direct traffic (no Proxy Protocol)
       - addr: "0.0.0.0:2222"
-        # real_ip:
-        #   strategy: ["proxy_protocol", "remote_addr"] # default
+        real_ip:
+          from: "remote_addr"
+          trust_private_ranges: true
 
   - name: "web"
     forward_to: "127.0.0.1:8080"
