@@ -2488,6 +2488,7 @@ dependencies = [
  "httparse",
  "ipnet",
  "libc",
+ "openssl",
  "pingora",
  "serde",
  "serde_repr",

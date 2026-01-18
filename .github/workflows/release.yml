@@ -40,7 +40,7 @@ jobs:
 
       - name: Build
         # 'cross' handles the containerized build environment for the specified target (musl)
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }} --features static-musl
 
       - name: Prepare Packaging Assets
         run: |
