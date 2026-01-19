@@ -1,5 +1,6 @@
 use crate::config::DatabaseConfig;
 use clickhouse::{Client, Row};
+mod migration;
 use serde::{Deserialize, Serialize};
 
 use serde_repr::{Deserialize_repr, Serialize_repr};
@@ -32,6 +33,8 @@ pub struct TcpLog {
   pub port: u16,
   pub proxy_proto: ProxyProto,
   pub bytes: u64,
+  pub bytes_sent: u64,
+  pub bytes_recv: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
@@ -45,6 +48,8 @@ struct TcpLogNew {
   pub port: u16,
   pub proxy_proto: ProxyProto,
   pub bytes: u64,
+  pub bytes_sent: u64,
+  pub bytes_recv: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -186,127 +191,8 @@ impl ClickHouseLogger {
   }
 
   async fn check_migrations(&self) -> anyhow::Result<()> {
-    // Create migrations table
-    self
-      .client
-      .query(
-        "
-      CREATE TABLE IF NOT EXISTS db_migrations (
-        version String,
-        success UInt8,
-        apply_ts DateTime64 DEFAULT now()
-      ) ENGINE = ReplacingMergeTree(apply_ts)
-      ORDER BY version
-    ",
-      )
-      .execute()
-      .await
-      .map_err(|e| anyhow::anyhow!("failed to create migrations table: {}", e))?;
-
-    // Get current DB version
-    #[derive(Row, Deserialize)]
-    struct MigrationRow {
-      version: String,
-      success: u8,
-    }
-
-    let last_migration = self
-      .client
-      .query("SELECT version, success FROM db_migrations ORDER BY apply_ts DESC LIMIT 1")
-      .fetch_optional::<MigrationRow>()
-      .await
-      .map_err(|e| anyhow::anyhow!("failed to fetch last migration: {}", e))?;
-
-    let (current_db_version, success) = last_migration
-      .map(|r| (r.version, r.success == 1))
-      .unwrap_or_else(|| ("v0.0.0".to_string(), true));
-
-    // Consolidate everything to v0.0.2
-    let target_version = "v0.0.2";
-
-    if current_db_version == target_version && success {
-      return Ok(());
-    }
-
-    info!(
-      "migrating database from {} to {}",
-      current_db_version, target_version
-    );
-
-    self.run_bootstrap_migration(target_version).await?;
-
-    Ok(())
-  }
-
-  async fn run_bootstrap_migration(&self, version: &str) -> anyhow::Result<()> {
-    info!("applying bootstrap migration {}...", version);
-
-    // 1. Create table (tcp_log)
-    let sql_create_tcp = r#"
-    CREATE TABLE IF NOT EXISTS tcp_log (
-        service     LowCardinality(String),
-        conn_ts     DateTime64(3),
-        duration    UInt32,
-        addr_family Enum8('unix'=1, 'ipv4'=2, 'ipv6'=10),
-        ip          IPv6,
-        port        UInt16,
-        proxy_proto Enum8('None' = 0, 'V1' = 1, 'V2' = 2),
-        bytes       UInt64
-    ) ENGINE = MergeTree() 
-    ORDER BY (service, conn_ts);
-    "#;
-    self.client.query(sql_create_tcp).execute().await?;
-
-    // 2. Create View
-    let sql_view_tcp = r#"
-      CREATE OR REPLACE VIEW tcp_log_view AS
-      SELECT 
-          service, conn_ts, duration, addr_family,
-          multiIf(
-            addr_family = 'unix', 'unix socket',
-            addr_family = 'ipv4', IPv4NumToString(toIPv4(ip)),
-            IPv6NumToString(ip)
-          ) as ip_str,
-          port,
-          proxy_proto,
-          formatReadableSize(bytes) AS traffic
-      FROM tcp_log
-      "#;
-    self.client.query(sql_view_tcp).execute().await?;
-
-    // 3. Create table (http_log)
-    let sql_create_http = r#"
-    CREATE TABLE IF NOT EXISTS http_log (
-        service     LowCardinality(String) CODEC(ZSTD(1)),
-        conn_ts     DateTime64(3) CODEC(Delta, ZSTD(1)),
-        duration    UInt32,
-        addr_family Enum8('unix'=1, 'ipv4'=2, 'ipv6'=10),
-        ip          IPv6,
-        proxy_proto Enum8('None' = 0, 'V1' = 1, 'V2' = 2),
-        resp_body_size  UInt64,
-        req_body_size   UInt64,
-        status_code UInt16,
-        method      LowCardinality(String),
-        host        LowCardinality(String),
-        path        String CODEC(ZSTD(1)),
-        user_agent  String CODEC(ZSTD(1))
-    ) ENGINE = MergeTree()
-    PARTITION BY toYYYYMM(conn_ts)
-    ORDER BY (conn_ts, service, host);
-    "#;
-    self.client.query(sql_create_http).execute().await?;
-
-    // Record success
-    self
-      .client
-      .query("INSERT INTO db_migrations (version, success) VALUES (?, 1)")
-      .bind(version)
-      .execute()
-      .await
-      .map_err(|e| anyhow::anyhow!("failed to record migration success: {}", e))?;
-
-    info!("bootstrap migration {} applied successfully", version);
-    Ok(())
+    let migrator = migration::Migrator::new(self.client.clone());
+    migrator.run().await
   }
 
   pub async fn insert_log(&self, log: TcpLog) -> anyhow::Result<()> {
@@ -324,6 +210,8 @@ impl ClickHouseLogger {
       port: log.port,
       proxy_proto: log.proxy_proto,
       bytes: log.bytes,
+      bytes_sent: log.bytes_sent,
+      bytes_recv: log.bytes_recv,
     };
 
     let mut insert = self.client.insert::<TcpLogNew>("tcp_log").await?;

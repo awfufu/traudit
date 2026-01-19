@@ -91,7 +91,7 @@ pub async fn handle_connection(
   };
   let upstream_async = upstream.into_async_stream()?;
 
-  let (spliced_bytes, splice_res) =
+  let ((s2c_bytes, c2s_bytes), splice_res) =
     forwarder::zero_copy_bidirectional(inbound_async, upstream_async).await;
 
   if let Err(e) = splice_res {
@@ -104,7 +104,9 @@ pub async fn handle_connection(
   }
 
   // Calculate total bytes
-  let total_bytes = spliced_bytes + read_buffer.len() as u64;
+  let bytes_sent = s2c_bytes;
+  let bytes_recv = c2s_bytes + read_buffer.len() as u64;
+  let total_bytes = bytes_sent + bytes_recv;
 
   // Logging logic
   let duration = start_instant.elapsed().as_millis() as u32;
@@ -133,6 +135,8 @@ pub async fn handle_connection(
     port: log_port,
     proxy_proto: proto_enum,
     bytes: total_bytes,
+    bytes_sent,
+    bytes_recv,
   };
 
   tokio::spawn(async move {

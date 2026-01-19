@@ -56,7 +56,7 @@ async fn splice_loop(read: &AsyncStream, write: &AsyncStream) -> (u64, io::Resul
 pub async fn zero_copy_bidirectional(
   inbound: AsyncStream,
   outbound: AsyncStream,
-) -> (u64, io::Result<()>) {
+) -> ((u64, u64), io::Result<()>) {
   // We own the streams now, so we can split references to them for the join.
   let ((c2s_bytes, c2s_res), (s2c_bytes, s2c_res)) = tokio::join!(
     async {
@@ -71,15 +71,17 @@ pub async fn zero_copy_bidirectional(
     }
   );
 
-  let total = c2s_bytes + s2c_bytes;
+  // s2c = sent (upstream -> client)
+  // c2s = recv (client -> upstream)
+  let metrics = (s2c_bytes, c2s_bytes);
 
   // Prefer returning the first error encountered, but prioritize keeping the bytes
   if let Err(e) = c2s_res {
-    return (total, Err(e));
+    return (metrics, Err(e));
   }
   if let Err(e) = s2c_res {
-    return (total, Err(e));
+    return (metrics, Err(e));
   }
 
-  (total, Ok(()))
+  (metrics, Ok(()))
 }
