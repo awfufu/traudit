@@ -163,9 +163,73 @@ where
 
 impl Config {
   pub async fn load<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
-    let content = fs::read_to_string(path).await?;
-    let config: Config = serde_yaml::from_str(&content)?;
+    let content = fs::read_to_string(&path).await?;
+    let deserializer = serde_yaml::Deserializer::from_str(&content);
+
+    // Track unknown fields
+    let mut unused = Vec::new();
+    let config: Config = serde_ignored::deserialize(deserializer, |path| {
+      unused.push(path.to_string());
+    })
+    .map_err(|e| anyhow::anyhow!("failed to parse config: {}", e))?;
+
+    if !unused.is_empty() {
+      let fields = unused.join(", ");
+      anyhow::bail!(
+        "configuration contains unknown or misplaced fields: [{}] in {}",
+        fields,
+        path.as_ref().display()
+      );
+    }
+
+    // Semantic validation
+    config.validate()?;
+
     Ok(config)
+  }
+
+  pub fn validate(&self) -> anyhow::Result<()> {
+    for service in &self.services {
+      // Rule 1 check: TCP cannot use XFF
+      // Check default/fallback real_ip logic if we had it, but currently real_ip is per-bind mostly?
+      // Actually ServiceConfig has strictly forward_to/binds. But wait, checking definition...
+      // Binds have real_ip. Service does NOT have real_ip in the struct definiton in this file,
+      // but Config struct shows "ServiceConfig" has "binds".
+      // User request said: "In tcp service, user wrote real_ip.from: xff".
+      // Let's check where real_ip is defined.
+      // Ah, checking the struct definition above... BindEntry has real_ip. ServiceConfig does NOT have real_ip field shown in previous view.
+      // Wait, let me re-verify the struct definition from the file content I have in context.
+
+      // Lines 34-43: ServiceConfig has name, type, binds, forward_to. NO real_ip.
+      // If user puts "real_ip" in service block, the "unused fields" check handles it (My Rule #3).
+      // So verification logic only needs to check BindEntry's real_ip.
+
+      for bind in &service.binds {
+        if let Some(real_ip) = &bind.real_ip {
+          // Rule 1: TCP + XFF
+          if service.service_type == "tcp" && real_ip.source == RealIpSource::Xff {
+            // Exception: If it's a TCP service but strictly doing HTTP analysis (unlikely in pure tcp mode unless using http parser?)
+            // User explicitly said "tcp service ... does not support xff".
+            // Assuming "type: tcp" implies no HTTP parsing layer is active to extract headers.
+            anyhow::bail!(
+               "Service '{}' is type 'tcp', but bind '{}' is configured to use 'xff' for real_ip. TCP services cannot parse HTTP headers.",
+               service.name,
+               bind.addr
+             );
+          }
+
+          // Rule 2: No Proxy + ProxyProtocol
+          if bind.proxy.is_none() && real_ip.source == RealIpSource::ProxyProtocol {
+            anyhow::bail!(
+               "Service '{}' bind '{}' requests real_ip from 'proxy_protocol', but proxy protocol support is not enabled (missing 'proxy: v1/v2').",
+               service.name,
+               bind.addr
+             );
+          }
+        }
+      }
+    }
+    Ok(())
   }
 }
 

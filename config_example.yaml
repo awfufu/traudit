@@ -13,9 +13,6 @@ services:
   - name: "ssh"
     forward_to: "127.0.0.1:22"
     type: "tcp"
-    real_ip:
-      from: "proxy_protocol"
-      trust_private_ranges: true
     binds:
       # Entry 1: Public traffic from FRP
       - addr: "0.0.0.0:2223"
