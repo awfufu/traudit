@@ -1,7 +1,7 @@
 use super::stream::InboundStream;
 use crate::config::{RealIpConfig, RealIpSource, ServiceConfig};
 use crate::core::forwarder;
-use crate::core::server::pingora_compat::PingoraStream;
+use crate::core::server::pingora_compat::UnifiedPingoraStream;
 use crate::core::upstream::UpstreamStream;
 use crate::db::clickhouse::{ClickHouseLogger, ProxyProto};
 use crate::protocol::{self, ProxyInfo};
@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info};
 
 pub async fn handle_connection(
-  stream: PingoraStream,
+  stream: UnifiedPingoraStream,
   proxy_info: Option<ProxyInfo>,
   service: ServiceConfig,
   db: Arc<ClickHouseLogger>,
@@ -36,13 +36,34 @@ pub async fn handle_connection(
     (std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0)
   };
 
-  // Unwrap stream
-  let (inbound, mut read_buffer) = stream.into_inner();
+  // Unwrap stream if Plain to attempt zero-copy, otherwise use generic stream
+  let mut read_buffer = BytesMut::new();
+  let mut inbound_enum: Option<InboundStream> = None;
+  let mut generic_stream: Option<UnifiedPingoraStream> = None;
 
-  let is_unix = matches!(inbound, InboundStream::Unix(_));
-  let remote_addr = match &inbound {
-    InboundStream::Tcp(s) => s.peer_addr()?,
-    InboundStream::Unix(_) => SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0),
+  if let UnifiedPingoraStream::Plain(s) = stream {
+    let (inbound, buf) = s.into_inner();
+    read_buffer = buf;
+    inbound_enum = Some(inbound);
+  } else {
+    generic_stream = Some(stream);
+  }
+
+  let is_unix = if let Some(ref inbound) = inbound_enum {
+    matches!(inbound, InboundStream::Unix(_))
+  } else {
+    false
+  };
+
+  let remote_addr = if let Some(ref inbound) = inbound_enum {
+    match inbound {
+      InboundStream::Tcp(s) => s.peer_addr()?,
+      InboundStream::Unix(_) => {
+        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0)
+      }
+    }
+  } else {
+    SocketAddr::new(final_ip, final_port)
   };
 
   // skip redundant proxy/IP resolution (done by listener); determine ProxyProto for logging
@@ -84,28 +105,50 @@ pub async fn handle_connection(
     upstream.write_all_buf(&mut read_buffer).await?;
   }
 
-  // 5. Zero-copy forwarding
-  let inbound_async = match inbound {
-    InboundStream::Tcp(s) => crate::core::upstream::AsyncStream::from_tokio_tcp(s)?,
-    InboundStream::Unix(s) => crate::core::upstream::AsyncStream::from_tokio_unix(s)?,
-  };
-  let upstream_async = upstream.into_async_stream()?;
+  // 5. Forwarding
+  let mut bytes_sent = 0;
+  let mut bytes_recv = 0;
 
-  let ((s2c_bytes, c2s_bytes), splice_res) =
-    forwarder::zero_copy_bidirectional(inbound_async, upstream_async).await;
+  if let Some(inbound) = inbound_enum {
+    // Splice Optimization Path
+    let inbound_async = match inbound {
+      InboundStream::Tcp(s) => crate::core::upstream::AsyncStream::from_tokio_tcp(s)?,
+      InboundStream::Unix(s) => crate::core::upstream::AsyncStream::from_tokio_unix(s)?,
+    };
+    let upstream_async = upstream.into_async_stream()?;
 
-  if let Err(e) = splice_res {
-    match e.kind() {
-      std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
-        tracing::debug!("[{}] connection closed: {}", service.name, e);
+    let ((s2c, c2s), res) = forwarder::zero_copy_bidirectional(inbound_async, upstream_async).await;
+
+    bytes_sent = s2c;
+    bytes_recv = c2s;
+
+    if let Err(e) = res {
+      match e.kind() {
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
+          tracing::debug!("[{}] connection closed: {}", service.name, e);
+        }
+        _ => error!("[{}] connection error: {}", service.name, e),
       }
-      _ => error!("[{}] connection error: {}", service.name, e),
+    }
+  } else if let Some(mut stream) = generic_stream {
+    // Generic Copy Path (TLS): internal buffer is automatically handled by the stream wrapper.
+    match tokio::io::copy_bidirectional(&mut stream, &mut upstream).await {
+      Ok((s2c, c2s)) => {
+        bytes_sent = s2c;
+        bytes_recv = c2s;
+      }
+      Err(e) => match e.kind() {
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
+          tracing::debug!("[{}] connection closed: {}", service.name, e);
+        }
+        _ => error!("[{}] connection error: {}", service.name, e),
+      },
     }
   }
 
   // Calculate total bytes
-  let bytes_sent = s2c_bytes;
-  let bytes_recv = c2s_bytes + read_buffer.len() as u64;
+  // bytes_sent/recv already set
+  let bytes_recv = bytes_recv + read_buffer.len() as u64;
   let total_bytes = bytes_sent + bytes_recv;
 
   // Logging logic

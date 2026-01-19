@@ -14,6 +14,7 @@ pub mod stream;
 
 use self::handler::handle_connection;
 use self::listener::{bind_listener, serve_listener_loop, UnifiedListener};
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
   let db_logger = ClickHouseLogger::new(&config.database).map_err(|e| {
@@ -50,8 +51,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
       // Use custom loop for TCP services or HTTP services requiring PROXY protocol parsing (not fully supported by pingora standard loop).
 
       let is_tcp_service = service.service_type == "tcp";
-      let is_http_proxy =
-        service.service_type == "http" && bind.proxy.is_some() && bind.tls.is_none();
+      // Use custom loop if Proxy Protocol is enabled, even if TLS is used
+      let is_http_proxy = service.service_type == "http" && bind.proxy.is_some();
 
       let use_custom_loop = is_tcp_service || is_http_proxy;
 
@@ -67,6 +68,30 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
       }
 
       // --- Custom Loop Logic ---
+
+      let mut tls_acceptor = None;
+      if let Some(tls_config) = &bind.tls {
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).map_err(|e| {
+          error!("failed to create ssl acceptor: {}", e);
+          anyhow::anyhow!(e)
+        })?;
+        let key_path = tls_config.key.as_deref().unwrap_or(&tls_config.cert);
+        acceptor
+          .set_private_key_file(key_path, SslFiletype::PEM)
+          .map_err(|e| {
+            error!("failed to load private key {}: {}", key_path, e);
+            anyhow::anyhow!(e)
+          })?;
+        acceptor
+          .set_certificate_chain_file(&tls_config.cert)
+          .map_err(|e| {
+            error!("failed to load cert chain {}: {}", tls_config.cert, e);
+            anyhow::anyhow!(e)
+          })?;
+        // ALPN support matching Pingora's defaults?
+        acceptor.set_alpn_protos(b"\x02h2\x08http/1.1").ok();
+        tls_acceptor = Some(Arc::new(acceptor.build()));
+      }
 
       let listener_res = bind_listener(&bind_addr, mode, &service_config.name).await;
 
@@ -118,6 +143,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
           service_config,
           real_ip_config,
           proxy_proto_config,
+          tls_acceptor,
           shutdown_dummy,
           move |stream, info| {
             let db = db.clone();
@@ -160,13 +186,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
           service_config,
           real_ip_config,
           proxy_proto_config,
+          tls_acceptor,
           shutdown_dummy.clone(),
           move |stream, _info| {
             let app = app.clone();
             let shutdown = shutdown_dummy.clone();
             async move {
-              let stream: pingora::protocols::Stream = Box::new(stream);
-              app.process_new(stream, &shutdown).await;
+              // stream is UnifiedPingoraStream
+              // Coerce to Box<dyn IO> (trait object implementation check)
+              app.process_new(Box::new(stream), &shutdown).await;
             }
           },
         ));

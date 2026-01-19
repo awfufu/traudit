@@ -26,12 +26,13 @@ serde_repr = "0.1.20"
 pingora = { version = "0.6", features = ["lb", "openssl"] }
 ipnet = { version = "2.11.0", features = ["serde"] }
 httparse = "1.10.1"
-openssl = { version = "0.10", optional = true }
+openssl = { version = "0.10" }
 serde_ignored = "0.1.14"
+tokio-openssl = "0.6"
 
 [features]
 default = []
-static-musl = ["openssl/vendored", "dep:openssl"]
+static-musl = ["openssl/vendored"]
 
 [dev-dependencies]
 tempfile = "3"

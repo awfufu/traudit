@@ -1,12 +1,15 @@
 use crate::config::ServiceConfig;
-use crate::core::server::pingora_compat::PingoraStream;
+use crate::core::server::pingora_compat::{PingoraStream, PingoraTlsStream, UnifiedPingoraStream};
 use crate::core::server::stream::InboundStream;
 use bytes::BytesMut;
+use openssl::ssl::{Ssl, SslAcceptor};
 use pingora::protocols::l4::socket::SocketAddr;
 use pingora::server::ShutdownWatch;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio_openssl::SslStream;
 use tracing::{error, info, warn};
 
 pub enum UnifiedListener {
@@ -106,10 +109,15 @@ pub async fn serve_listener_loop<F, Fut>(
   service: ServiceConfig,
   real_ip_config: Option<crate::config::RealIpConfig>,
   proxy_cfg: Option<String>,
+  tls_acceptor: Option<Arc<SslAcceptor>>,
   _shutdown: ShutdownWatch,
   handler: F,
 ) where
-  F: Fn(PingoraStream, Option<crate::protocol::ProxyInfo>) -> Fut + Send + Sync + 'static + Clone,
+  F: Fn(UnifiedPingoraStream, Option<crate::protocol::ProxyInfo>) -> Fut
+    + Send
+    + Sync
+    + 'static
+    + Clone,
   Fut: std::future::Future<Output = ()> + Send,
 {
   loop {
@@ -119,6 +127,7 @@ pub async fn serve_listener_loop<F, Fut>(
         let service = service.clone();
         let real_ip_config = real_ip_config.clone();
         let handler = handler.clone();
+        let tls_acceptor = tls_acceptor.clone();
 
         tokio::spawn(async move {
           let mut buffer = BytesMut::new();
@@ -179,7 +188,7 @@ pub async fn serve_listener_loop<F, Fut>(
           }
           .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
 
-          // 3. Construct PingoraStream
+          // 3. Construct base PingoraStream
           let stream = PingoraStream::new(
             stream,
             buffer,
@@ -193,7 +202,32 @@ pub async fn serve_listener_loop<F, Fut>(
             },
           );
 
-          // 4. Handler
+          // 4. TLS Handshake if configured
+          let stream: UnifiedPingoraStream = if let Some(acceptor) = tls_acceptor {
+            match Ssl::new(acceptor.context()) {
+              Ok(ssl) => match SslStream::new(ssl, stream) {
+                Ok(mut ssl_stream) => match std::pin::Pin::new(&mut ssl_stream).accept().await {
+                  Ok(_) => UnifiedPingoraStream::Tls(PingoraTlsStream::new(ssl_stream)),
+                  Err(e) => {
+                    error!("[{}] tls handshake failed: {}", service.name, e);
+                    return;
+                  }
+                },
+                Err(e) => {
+                  error!("[{}] failed to create ssl stream: {}", service.name, e);
+                  return;
+                }
+              },
+              Err(e) => {
+                error!("[{}] failed to create ssl object: {}", service.name, e);
+                return;
+              }
+            }
+          } else {
+            UnifiedPingoraStream::Plain(stream)
+          };
+
+          // 5. Handler
           handler(stream, proxy_info).await;
         });
       }
