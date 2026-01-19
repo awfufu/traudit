@@ -172,6 +172,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
           service_config: service_config.clone(),
           listen_addr: bind_addr.clone(),
           real_ip: real_ip_config.clone(),
+          add_xff_header: bind.add_xff_header,
         };
         let mut service_obj = http_proxy_service(&conf, inner_proxy);
         let app = unsafe {
@@ -223,6 +224,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             service_config: svc_config.clone(),
             listen_addr: bind.addr.clone(),
             real_ip,
+            add_xff_header: bind.add_xff_header,
           };
 
           let mut service = http_proxy_service(&server.configuration, proxy);

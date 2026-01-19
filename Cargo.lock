@@ -2495,6 +2495,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clickhouse",
+ "http",
  "httparse",
  "ipnet",
  "libc",

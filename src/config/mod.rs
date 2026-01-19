@@ -102,6 +102,8 @@ pub struct BindEntry {
   #[serde(default = "default_socket_mode", deserialize_with = "deserialize_mode")]
   pub mode: u32,
   pub tls: Option<TlsConfig>,
+  #[serde(default)]
+  pub add_xff_header: bool,
   pub real_ip: Option<RealIpConfig>,
 }
 
@@ -225,6 +227,19 @@ impl Config {
                service.name,
                bind.addr
              );
+          }
+        }
+
+        // Rule 3: Check for XFF loop
+        if bind.add_xff_header {
+          if let Some(real_ip) = &bind.real_ip {
+            if real_ip.source == RealIpSource::Xff {
+              anyhow::bail!(
+                 "Service '{}' bind '{}' has 'add_xff_header: true' but 'real_ip.from' is 'xff'. This is not allowed as it would duplicate the IP.",
+                 service.name,
+                 bind.addr
+               );
+            }
           }
         }
       }

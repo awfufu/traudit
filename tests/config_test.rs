@@ -105,3 +105,30 @@ fn test_trusted_proxies_mixed_formats() {
   assert!(!config.is_trusted("10.0.1.1".parse().unwrap())); // Outside /24
   assert!(!config.is_trusted("2001:db9::1".parse().unwrap())); // Outside /32
 }
+
+#[tokio::test]
+async fn test_error_xff_loop() {
+  let config_str = r#"
+database:
+  type: clickhouse
+  dsn: "http://127.0.0.1:8123"
+services:
+  - name: "loop-service"
+    type: "http"
+    forward_to: "127.0.0.1:8080"
+    binds:
+      - addr: "0.0.0.0:443"
+        proxy: v2
+        add_xff_header: true
+        real_ip:
+          from: "xff"
+"#;
+  let mut file = tempfile::NamedTempFile::new().unwrap();
+  write!(file, "{}", config_str).unwrap();
+  let path = file.path().to_path_buf();
+
+  let res = Config::load(&path).await;
+  assert!(res.is_err());
+  let err = res.err().unwrap().to_string();
+  assert!(err.contains("duplicate the IP"));
+}

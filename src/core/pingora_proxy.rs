@@ -11,6 +11,7 @@ pub struct TrauditProxy {
   pub service_config: ServiceConfig,
   pub listen_addr: String,
   pub real_ip: Option<crate::config::RealIpConfig>,
+  pub add_xff_header: bool,
 }
 
 pub struct HttpContext {
@@ -116,6 +117,30 @@ impl ProxyHttp for TrauditProxy {
     }
 
     ctx.src_ip = resolved_ip;
+
+    // 1.5. Inject X-Forwarded-For if configured
+    if self.add_xff_header {
+      let src_ip_str = resolved_ip.to_string();
+
+      // Collect existing headers to avoid double borrow
+      let mut owned_values: Vec<String> = session
+        .req_header()
+        .headers
+        .get_all("X-Forwarded-For")
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
+        .collect();
+
+      owned_values.push(src_ip_str);
+      let new_val = owned_values.join(", ");
+
+      if let Ok(valid_header) = http::header::HeaderValue::from_str(&new_val) {
+        // insert_header replaces all existing headers with this name
+        let _ = session
+          .req_header_mut()
+          .insert_header("X-Forwarded-For", valid_header);
+      }
+    }
 
     // Log connection info
     let src_fmt = resolved_ip.to_string();

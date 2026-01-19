@@ -12,6 +12,7 @@ tokio = { version = "1", features = ["full"] }
 clickhouse = { version = "0.14", features = ["time"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+http = "1"
 socket2 = "0.6"
 libc = "0.2"
 tracing = "0.1"
