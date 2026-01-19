@@ -76,11 +76,8 @@ fn is_private(ip: &IpAddr) -> bool {
     IpAddr::V4(addr) => addr.is_loopback() || addr.is_link_local() || addr.is_private(),
     IpAddr::V6(addr) => {
       addr.is_loopback() ||
-            // addr.is_unique_local() is unstable, check ranges manually
-            // fc00::/7
-            (addr.segments()[0] & 0xfe00) == 0xfc00 ||
-            // fe80::/10
-            (addr.segments()[0] & 0xffc0) == 0xfe80
+            // fc00::/7 (unique local) and fe80::/10 (link-local)
+            (addr.segments()[0] & 0xfe00) == 0xfc00 || (addr.segments()[0] & 0xffc0) == 0xfe80
     }
   }
 }
@@ -131,7 +128,7 @@ where
   let value = ModeValue::deserialize(deserializer)?;
   match value {
     ModeValue::Integer(i) => {
-      // Interpret decimal integer as octal (e.g., 666 -> 0666) per requirements.
+      // Interpret decimal integer as octal (e.g., 666 -> 0666)
       let s = i.to_string();
       u32::from_str_radix(&s, 8).map_err(serde::de::Error::custom)
     }
@@ -192,27 +189,10 @@ impl Config {
 
   pub fn validate(&self) -> anyhow::Result<()> {
     for service in &self.services {
-      // Rule 1 check: TCP cannot use XFF
-      // Check default/fallback real_ip logic if we had it, but currently real_ip is per-bind mostly?
-      // Actually ServiceConfig has strictly forward_to/binds. But wait, checking definition...
-      // Binds have real_ip. Service does NOT have real_ip in the struct definiton in this file,
-      // but Config struct shows "ServiceConfig" has "binds".
-      // User request said: "In tcp service, user wrote real_ip.from: xff".
-      // Let's check where real_ip is defined.
-      // Ah, checking the struct definition above... BindEntry has real_ip. ServiceConfig does NOT have real_ip field shown in previous view.
-      // Wait, let me re-verify the struct definition from the file content I have in context.
-
-      // Lines 34-43: ServiceConfig has name, type, binds, forward_to. NO real_ip.
-      // If user puts "real_ip" in service block, the "unused fields" check handles it (My Rule #3).
-      // So verification logic only needs to check BindEntry's real_ip.
-
       for bind in &service.binds {
         if let Some(real_ip) = &bind.real_ip {
-          // Rule 1: TCP + XFF
+          // Rule 1: TCP services cannot use XFF as they don't parse HTTP headers
           if service.service_type == "tcp" && real_ip.source == RealIpSource::Xff {
-            // Exception: If it's a TCP service but strictly doing HTTP analysis (unlikely in pure tcp mode unless using http parser?)
-            // User explicitly said "tcp service ... does not support xff".
-            // Assuming "type: tcp" implies no HTTP parsing layer is active to extract headers.
             anyhow::bail!(
                "Service '{}' is type 'tcp', but bind '{}' is configured to use 'xff' for real_ip. TCP services cannot parse HTTP headers.",
                service.name,
@@ -220,7 +200,7 @@ impl Config {
              );
           }
 
-          // Rule 2: No Proxy + ProxyProtocol
+          // Rule 2: ProxyProtocol requires proxy protocol support enabled
           if bind.proxy.is_none() && real_ip.source == RealIpSource::ProxyProtocol {
             anyhow::bail!(
                "Service '{}' bind '{}' requests real_ip from 'proxy_protocol', but proxy protocol support is not enabled (missing 'proxy: v1/v2').",
@@ -230,7 +210,7 @@ impl Config {
           }
         }
 
-        // Rule 3: Check for XFF loop
+        // Rule 3: Avoid XFF loops (adding header + using header as source)
         if bind.add_xff_header {
           if let Some(real_ip) = &bind.real_ip {
             if real_ip.source == RealIpSource::Xff {
