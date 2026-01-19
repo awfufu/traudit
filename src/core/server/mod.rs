@@ -7,6 +7,7 @@ use std::sync::{Arc, Barrier};
 use tokio::signal;
 use tracing::{error, info};
 
+pub mod context;
 pub mod handler;
 mod listener;
 mod pingora_compat;
@@ -107,15 +108,55 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         UnifiedListener::Tcp(_) => "tcp",
       };
 
+      let mut extra_info = String::new();
+      if let Some(p) = &service_config.binds[0].proxy {
+        let v = match p.as_str() {
+          "v1" => "(proxy.v1)",
+          "v2" => "(proxy.v2)",
+          _ => "",
+        };
+        extra_info.push_str(v);
+      }
+
+      let proxy_tag = match proxy_proto_config.as_deref() {
+        Some("v1") => "(proxy.v1)",
+        Some("v2") => "(proxy.v2)",
+        _ => "",
+      };
+
+      let xff_tag = if real_ip_config
+        .as_ref()
+        .map(|c| c.source == crate::config::RealIpSource::Xff)
+        .unwrap_or(false)
+      {
+        "(xff)"
+      } else {
+        ""
+      };
+
+      let mut tags = Vec::new();
+      if !proxy_tag.is_empty() {
+        tags.push(proxy_tag);
+      }
+      if !xff_tag.is_empty() {
+        tags.push(xff_tag);
+      }
+
+      let tag_str = if tags.is_empty() {
+        String::new()
+      } else {
+        format!(" {}", tags.join(" "))
+      };
+
       if is_http_proxy {
         info!(
-          "[{}] listening on http {} {} (PROXY support)",
-          service_config.name, listen_type, bind_addr
+          "[{}] listening on http {} {}{}",
+          service_config.name, listen_type, bind_addr, tag_str
         );
       } else {
         info!(
-          "[{}] listening on {} {}",
-          service_config.name, listen_type, bind_addr
+          "[{}] listening on {} {}{}",
+          service_config.name, listen_type, bind_addr, tag_str
         );
       }
 
@@ -141,16 +182,19 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         join_set.spawn(serve_listener_loop(
           listener,
           service_config,
-          real_ip_config,
+          real_ip_config.clone(),
           proxy_proto_config,
           tls_acceptor,
           shutdown_dummy,
-          move |stream, info| {
+          move |stream, info, client_addr| {
             let db = db.clone();
             let svc = svc_cfg.clone();
             let addr = listen_addr_log.clone();
+            let real_ip_cloned = real_ip_config.clone();
             async move {
-              if let Err(e) = handle_connection(stream, info, svc, db, addr).await {
+              if let Err(e) =
+                handle_connection(stream, info, svc, db, addr, client_addr, real_ip_cloned).await
+              {
                 match e.kind() {
                   std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
                     tracing::debug!("connection closed: {}", e);
@@ -189,13 +233,23 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
           proxy_proto_config,
           tls_acceptor,
           shutdown_dummy.clone(),
-          move |stream, _info| {
+          move |stream, info, client_addr| {
             let app = app.clone();
             let shutdown = shutdown_dummy.clone();
             async move {
               // stream is UnifiedPingoraStream
               // Coerce to Box<dyn IO> (trait object implementation check)
-              app.process_new(Box::new(stream), &shutdown).await;
+
+              let meta = crate::core::server::context::ConnectionMetadata {
+                physical_addr: client_addr,
+                proxy_info: info,
+              };
+
+              crate::core::server::context::CONNECTION_META
+                .scope(meta, async move {
+                  app.process_new(Box::new(stream), &shutdown).await;
+                })
+                .await;
             }
           },
         ));

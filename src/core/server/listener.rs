@@ -113,7 +113,7 @@ pub async fn serve_listener_loop<F, Fut>(
   _shutdown: ShutdownWatch,
   handler: F,
 ) where
-  F: Fn(UnifiedPingoraStream, Option<crate::protocol::ProxyInfo>) -> Fut
+  F: Fn(UnifiedPingoraStream, Option<crate::protocol::ProxyInfo>, std::net::SocketAddr) -> Fut
     + Send
     + Sync
     + 'static
@@ -228,7 +228,7 @@ pub async fn serve_listener_loop<F, Fut>(
           };
 
           // 5. Handler
-          handler(stream, proxy_info).await;
+          handler(stream, proxy_info, client_addr).await;
         });
       }
       Err(e) => {

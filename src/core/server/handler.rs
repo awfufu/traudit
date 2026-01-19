@@ -19,6 +19,8 @@ pub async fn handle_connection(
   service: ServiceConfig,
   db: Arc<ClickHouseLogger>,
   listen_addr: String,
+  physical_addr: SocketAddr,
+  real_ip_config: Option<RealIpConfig>,
 ) -> std::io::Result<u64> {
   let conn_ts = time::OffsetDateTime::now_utc();
   let start_instant = std::time::Instant::now();
@@ -29,7 +31,6 @@ pub async fn handle_connection(
     if let Some(pingora::protocols::l4::socket::SocketAddr::Inet(addr)) = d.peer_addr() {
       (addr.ip(), addr.port())
     } else {
-      // Should not match other types if logic is correct
       (std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0)
     }
   } else {
@@ -55,16 +56,52 @@ pub async fn handle_connection(
     false
   };
 
-  let remote_addr = if let Some(ref inbound) = inbound_enum {
-    match inbound {
-      InboundStream::Tcp(s) => s.peer_addr()?,
-      InboundStream::Unix(_) => {
-        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0)
-      }
-    }
+  let src_fmt = if is_unix {
+    "local".to_string()
   } else {
-    SocketAddr::new(final_ip, final_port)
+    physical_addr.to_string()
   };
+
+  let mut extras = Vec::new();
+  let mut is_untrusted = false;
+
+  // Determine untrusted status based solely on RealIpConfig trust range
+  if let Some(ref cfg) = real_ip_config {
+    if !cfg.is_trusted(physical_addr.ip()) {
+      is_untrusted = true;
+    }
+  }
+
+  // If we have proxy info, we should show it.
+  if let Some(ref info) = proxy_info {
+    // Only show (untrusted) if we have proxy info and the source is not trusted
+    if is_untrusted {
+      extras.push("(untrusted)".to_string());
+    }
+
+    let helper_str;
+    let version_str = match info.version {
+      protocol::Version::V1 => "proxy.v1",
+      protocol::Version::V2 => "proxy.v2",
+    };
+    helper_str = format!("{}: {}", version_str, info.source);
+    extras.push(format!("({})", helper_str));
+  } else if is_untrusted && real_ip_config.is_some() {
+  }
+
+  let log_msg = if extras.is_empty() {
+    format!("[{}] {} <- {}", service.name, listen_addr, src_fmt)
+  } else {
+    format!(
+      "[{}] {} <- {} {}",
+      service.name,
+      listen_addr,
+      src_fmt,
+      extras.join(" ")
+    )
+  };
+
+  info!("{}", log_msg);
 
   // skip redundant proxy/IP resolution (done by listener); determine ProxyProto for logging
   let proto_enum = if let Some(ref info) = proxy_info {
@@ -75,27 +112,6 @@ pub async fn handle_connection(
   } else {
     ProxyProto::None
   };
-
-  // Log connection info
-  let src_fmt = if is_unix && proto_enum == ProxyProto::None {
-    "local".to_string()
-  } else {
-    final_ip.to_string()
-  };
-  let physical_fmt = if is_unix {
-    "local".to_string()
-  } else {
-    remote_addr.to_string()
-  };
-
-  if src_fmt == physical_fmt {
-    info!("[{}] {} <- {}", service.name, listen_addr, src_fmt);
-  } else {
-    info!(
-      "[{}] {} <- {} ({})",
-      service.name, listen_addr, src_fmt, physical_fmt
-    );
-  }
 
   // 3. Connect Upstream
   let mut upstream = UpstreamStream::connect(&service.forward_to).await?;

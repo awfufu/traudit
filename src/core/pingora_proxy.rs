@@ -143,53 +143,63 @@ impl ProxyHttp for TrauditProxy {
     }
 
     // Log connection info
-    let src_fmt = resolved_ip.to_string();
-    let physical_fmt = peer_addr.to_string();
+    let (physical_addr, proxy_info) = crate::core::server::context::CONNECTION_META
+      .try_with(|meta| (meta.physical_addr, meta.proxy_info.clone()))
+      .unwrap_or((std::net::SocketAddr::new(peer_addr, 0), None));
+    let physical_fmt = physical_addr.to_string();
 
-    if src_fmt == physical_fmt {
-      // If we stuck to physical, check if there was an XFF we ignored
-      let xff_msg = if let Some(xff) = session.req_header().headers.get("x-forwarded-for") {
-        if let Ok(v) = xff.to_str() {
-          // Only show if we actually have RealIpConfig that denied us
-          if let Some(cfg) = &self.real_ip {
-            if !cfg.is_trusted(peer_addr) {
-              format!("(untrusted) xff: {}", v)
-            } else {
-              "".to_string()
-            }
-          } else {
-            "".to_string()
-          }
-        } else {
-          "".to_string()
-        }
-      } else {
-        "".to_string()
+    let mut extras = Vec::new();
+    let is_untrusted = self
+      .real_ip
+      .as_ref()
+      .map_or(false, |cfg| !cfg.is_trusted(physical_addr.ip()));
+
+    if let Some(info) = proxy_info {
+      let v = match info.version {
+        crate::protocol::Version::V1 => "proxy.v1",
+        _ => "proxy.v2",
       };
+      extras.push(format!("{}: {}", v, info.source));
+    }
 
-      if !xff_msg.is_empty() {
-        tracing::info!(
-          "[{}] {} <- {} {}",
-          self.service_config.name,
-          self.listen_addr,
-          src_fmt,
-          xff_msg
-        );
-      } else {
-        tracing::info!(
-          "[{}] {} <- {}",
-          self.service_config.name,
-          self.listen_addr,
-          src_fmt
-        );
+    if let Some(xff) = session.req_header().headers.get("x-forwarded-for") {
+      if let Ok(v) = xff.to_str() {
+        if resolved_ip != peer_addr {
+          extras.push(format!("xff: {}", resolved_ip));
+        } else if self
+          .real_ip
+          .as_ref()
+          .map_or(false, |cfg| !cfg.is_trusted(peer_addr))
+        {
+          extras.push(format!("xff: {}", v));
+        }
       }
-    } else {
+    }
+    let mut extra_str = String::new();
+    if is_untrusted {
+      extra_str.push_str("(untrusted) ");
+    }
+    for (i, e) in extras.iter().enumerate() {
+      extra_str.push_str(&format!("({})", e));
+      if i < extras.len() - 1 {
+        extra_str.push_str(" ");
+      }
+    }
+
+    if extra_str.is_empty() {
       tracing::info!(
-        "[{}] {} <- {} ({})",
+        "[{}] {} <- {}",
         self.service_config.name,
         self.listen_addr,
-        src_fmt,
         physical_fmt
+      );
+    } else {
+      tracing::info!(
+        "[{}] {} <- {} {}",
+        self.service_config.name,
+        self.listen_addr,
+        physical_fmt,
+        extra_str
       );
     }
 
