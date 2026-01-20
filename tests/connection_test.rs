@@ -16,7 +16,8 @@ use traudit::config::{
 // Testcontainers
 use ctor::dtor;
 use std::sync::Mutex;
-use testcontainers::{clients, GenericImage};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{GenericImage, ImageExt};
 
 // TLS Dependencies
 use rcgen::generate_simple_self_signed;
@@ -47,28 +48,24 @@ async fn get_shared_db_port() -> u16 {
     .get_or_init(|| async {
       init_env();
 
-      // Blocking docker interactions
-      let port = tokio::task::spawn_blocking(|| {
-        let docker = Box::leak(Box::new(clients::Cli::default()));
-        let image = GenericImage::new("clickhouse/clickhouse-server", "latest")
-          .with_env_var("CLICKHOUSE_DB", "traudit")
-          .with_env_var("CLICKHOUSE_USER", "traudit")
-          .with_env_var("CLICKHOUSE_PASSWORD", "traudit")
-          .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1");
+      let image = GenericImage::new("clickhouse/clickhouse-server", "latest")
+        .with_env_var("CLICKHOUSE_DB", "traudit")
+        .with_env_var("CLICKHOUSE_USER", "traudit")
+        .with_env_var("CLICKHOUSE_PASSWORD", "traudit")
+        .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1");
 
-        let container = docker.run(image);
-        let port = container.get_host_port_ipv4(8123);
+      let container = image.start().await.expect("Failed to start container");
+      let port = container
+        .get_host_port_ipv4(8123)
+        .await
+        .expect("Failed to get port");
 
-        // Save ID for cleanup
-        if let Ok(mut info) = CLEANUP_INFO.lock() {
-          info.container_id = Some(container.id().to_string());
-        }
+      // Save ID for cleanup
+      if let Ok(mut info) = CLEANUP_INFO.lock() {
+        info.container_id = Some(container.id().to_string());
+      }
 
-        Box::leak(Box::new(container));
-        port
-      })
-      .await
-      .unwrap();
+      Box::leak(Box::new(container));
 
       // Async wait
       wait_for_clickhouse(port).await;
@@ -110,6 +107,21 @@ fn init_env() {
       .with_test_writer()
       .try_init()
       .ok();
+
+    // Install Rustls Crypto Provider (Ring)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Detect Podman socket if Docker socket is missing
+    if std::env::var("DOCKER_HOST").is_err()
+      && !std::path::Path::new("/var/run/docker.sock").exists()
+    {
+      if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        let podman_sock = std::path::Path::new(&runtime_dir).join("podman/podman.sock");
+        if podman_sock.exists() {
+          std::env::set_var("DOCKER_HOST", format!("unix://{}", podman_sock.display()));
+        }
+      }
+    }
 
     // Create docker shim for podman if docker is missing
     if std::process::Command::new("docker")
@@ -249,10 +261,10 @@ struct CertBundle {
 
 fn generate_cert() -> CertBundle {
   let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-  let cert = generate_simple_self_signed(subject_alt_names).unwrap();
+  let certified_key = generate_simple_self_signed(subject_alt_names).unwrap();
   CertBundle {
-    cert_pem: cert.serialize_pem().unwrap(),
-    key_pem: cert.serialize_private_key_pem(),
+    cert_pem: certified_key.cert.pem(),
+    key_pem: certified_key.key_pair.serialize_pem(),
   }
 }
 
@@ -504,18 +516,16 @@ async fn run_http_test(
         .unwrap();
       let mut pem = std::io::BufReader::new(&cert_bytes[..]);
       let certs = rustls_pemfile::certs(&mut pem)
-        .unwrap()
-        .into_iter()
-        .map(rustls::Certificate)
+        .map(|c| c.unwrap())
+        .map(rustls::pki_types::CertificateDer::from)
         .collect::<Vec<_>>();
-      root_store.add(&certs[0]).unwrap();
+      root_store.add(certs[0].clone()).unwrap();
 
       let config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
         .with_root_certificates(root_store)
         .with_no_client_auth();
       let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
-      let domain = rustls::ServerName::try_from("localhost").unwrap();
+      let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
       let mut tls_stream = connector
         .connect(domain, stream)
         .await
