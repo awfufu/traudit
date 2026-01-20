@@ -10,7 +10,22 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Tests
+        # Docker is pre-installed on ubuntu-latest, so testcontainers will work automatically.
+        run: cargo test
+
   build-and-release:
+    needs: test
     name: Build and Release
     runs-on: ubuntu-latest
     strategy:
