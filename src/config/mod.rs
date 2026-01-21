@@ -40,6 +40,8 @@ pub struct ServiceConfig {
   pub binds: Vec<BindEntry>,
   #[serde(rename = "forward_to")]
   pub forward_to: String,
+  #[serde(rename = "upstream_proxy")]
+  pub upstream_proxy: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -223,6 +225,17 @@ impl Config {
           }
         }
       }
+
+      if let Some(upstream_proxy) = &service.upstream_proxy {
+        match upstream_proxy.as_str() {
+          "v1" | "v2" => {},
+          other => anyhow::bail!(
+            "Service '{}' has invalid 'upstream_proxy' value '{}'. Allowed values are 'v1' or 'v2'.",
+            service.name,
+            other
+          ),
+        }
+      }
     }
     Ok(())
   }
@@ -265,6 +278,7 @@ services:
     assert_eq!(config.services[0].binds[0].addr, "0.0.0.0:22222");
     assert_eq!(config.services[0].binds[0].proxy, Some("v2".to_string()));
     assert_eq!(config.services[0].forward_to, "127.0.0.1:22");
+    assert_eq!(config.services[0].upstream_proxy, None);
   }
 
   #[test]

@@ -182,7 +182,7 @@ impl ProxyHttp for TrauditProxy {
     for (i, e) in extras.iter().enumerate() {
       extra_str.push_str(&format!("({})", e));
       if i < extras.len() - 1 {
-        extra_str.push_str(" ");
+        extra_str.push(' ');
       }
     }
 

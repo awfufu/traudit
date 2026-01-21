@@ -9,6 +9,9 @@ pub struct ProxyInfo {
   pub source: SocketAddr,
 }
 
+mod writer;
+pub use writer::*;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {
   V1,

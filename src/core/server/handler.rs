@@ -27,14 +27,27 @@ pub async fn handle_connection(
 
   // Extract resolved IP from digest (injected by listener)
   let digest = stream.get_socket_digest();
-  let (final_ip, final_port) = if let Some(d) = digest {
-    if let Some(pingora::protocols::l4::socket::SocketAddr::Inet(addr)) = d.peer_addr() {
+  let (final_ip, final_port, local_addr_opt) = if let Some(d) = &digest {
+    let peer = if let Some(pingora::protocols::l4::socket::SocketAddr::Inet(addr)) = d.peer_addr() {
       (addr.ip(), addr.port())
     } else {
       (std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0)
-    }
+    };
+
+    let local = if let Some(pingora::protocols::l4::socket::SocketAddr::Inet(addr)) = d.local_addr()
+    {
+      Some(SocketAddr::new(addr.ip(), addr.port()))
+    } else {
+      None
+    };
+
+    (peer.0, peer.1, local)
   } else {
-    (std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0)
+    (
+      std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+      0,
+      None,
+    )
   };
 
   // Unwrap stream if Plain to attempt zero-copy, otherwise use generic stream
@@ -79,12 +92,11 @@ pub async fn handle_connection(
       extras.push("(untrusted)".to_string());
     }
 
-    let helper_str;
     let version_str = match info.version {
       protocol::Version::V1 => "proxy.v1",
       protocol::Version::V2 => "proxy.v2",
     };
-    helper_str = format!("{}: {}", version_str, info.source);
+    let helper_str = format!("{}: {}", version_str, info.source);
     extras.push(format!("({})", helper_str));
   } else if is_untrusted && real_ip_config.is_some() {
   }
@@ -115,6 +127,24 @@ pub async fn handle_connection(
 
   // 3. Connect Upstream
   let mut upstream = UpstreamStream::connect(&service.forward_to).await?;
+
+  // [NEW] Send Proxy Protocol Header if configured
+  if let Some(upstream_ver) = &service.upstream_proxy {
+    // Resolve addresses
+    let src_addr = SocketAddr::new(final_ip, final_port);
+    // Use extracted local_addr or fallback to physical_addr (server socket)
+    let dst_addr = local_addr_opt.unwrap_or(physical_addr);
+
+    let version = match upstream_ver.as_str() {
+      "v1" => protocol::Version::V1,
+      _ => protocol::Version::V2,
+    };
+
+    if let Err(e) = protocol::write_proxy_header(&mut upstream, version, src_addr, dst_addr).await {
+      error!("Failed to write proxy header to upstream: {}", e);
+      return Err(e);
+    }
+  }
 
   // 4. Write buffered data
   if !read_buffer.is_empty() {
