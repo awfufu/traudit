@@ -43,11 +43,13 @@ async fn write_v2<T: AsyncWrite + Unpin>(
   src: SocketAddr,
   dst: SocketAddr,
 ) -> io::Result<()> {
+  let mut buffer = Vec::with_capacity(32);
+
   // Signature
-  stream.write_all(V2_PREFIX).await?;
+  buffer.extend_from_slice(V2_PREFIX);
 
   // Version + Command (Ver=2, Cmd=1 Proxy) -> 0x21
-  stream.write_u8(0x21).await?;
+  buffer.push(0x21);
 
   // Family + Protocol
   let (fam, len) = match (src, dst) {
@@ -62,35 +64,34 @@ async fn write_v2<T: AsyncWrite + Unpin>(
       (0x21, 36u16)
     }
     _ => {
-      // Mismatched families? Should not happen in normal flows if we stick to one protocol.
-      // But if it happens, we might just send UNSPEC or fail.
-      // Let's send UNSPEC (AF_UNSPEC=0, UNSPEC=0) -> 0x00 and len 0
-      stream.write_u8(0x00).await?;
-      stream.write_u16(0).await?;
-      return Ok(());
+      // Mismatched families or unknown
+      // Send UNSPEC (AF_UNSPEC=0, UNSPEC=0) -> 0x00 and len 0
+      buffer.push(0x00);
+      buffer.extend_from_slice(&0u16.to_be_bytes());
+      return stream.write_all(&buffer).await;
     }
   };
 
-  stream.write_u8(fam).await?;
-  stream.write_u16(len).await?;
+  buffer.push(fam);
+  buffer.extend_from_slice(&len.to_be_bytes());
 
   match (src, dst) {
     (SocketAddr::V4(s), SocketAddr::V4(d)) => {
-      stream.write_all(&s.ip().octets()).await?;
-      stream.write_all(&d.ip().octets()).await?;
-      stream.write_u16(s.port()).await?;
-      stream.write_u16(d.port()).await?;
+      buffer.extend_from_slice(&s.ip().octets());
+      buffer.extend_from_slice(&d.ip().octets());
+      buffer.extend_from_slice(&s.port().to_be_bytes());
+      buffer.extend_from_slice(&d.port().to_be_bytes());
     }
     (SocketAddr::V6(s), SocketAddr::V6(d)) => {
-      stream.write_all(&s.ip().octets()).await?;
-      stream.write_all(&d.ip().octets()).await?;
-      stream.write_u16(s.port()).await?;
-      stream.write_u16(d.port()).await?;
+      buffer.extend_from_slice(&s.ip().octets());
+      buffer.extend_from_slice(&d.ip().octets());
+      buffer.extend_from_slice(&s.port().to_be_bytes());
+      buffer.extend_from_slice(&d.port().to_be_bytes());
     }
     _ => {}
   }
 
-  Ok(())
+  stream.write_all(&buffer).await
 }
 
 #[cfg(test)]
@@ -141,5 +142,34 @@ mod tests {
     // 2000 = 07 D0
     let payload = &buf[16..];
     assert_eq!(payload, &[1, 1, 1, 1, 2, 2, 2, 2, 0x03, 0xE8, 0x07, 0xD0]);
+  }
+
+  #[tokio::test]
+  async fn test_write_v2_unspecified_dst() {
+    let mut buf = Vec::new();
+    let mut cursor = Cursor::new(&mut buf);
+    // Simulate what might be happening: 127.0.0.1 -> 0.0.0.0 (if physical addr is used as dst and it is 0.0.0.0)
+    let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 42070);
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 2222);
+
+    write_proxy_header(&mut cursor, Version::V2, src, dst)
+      .await
+      .unwrap();
+
+    // Verify bytes manually
+    // Sig: \x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A
+    // Ver/Cmd: 0x21
+    // Fam/Proto: 0x11
+    // Len: 12 (0x000C)
+    // Src: 7F 00 00 01
+    // Dst: 00 00 00 00
+    // SrcPort: A4 56 (42070)
+    // DstPort: 08 AE (2222)
+
+    let expected = vec![
+      0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x21, 0x11, 0x00,
+      0x0C, 0x7F, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xA4, 0x56, 0x08, 0xAE,
+    ];
+    assert_eq!(buf, expected);
   }
 }

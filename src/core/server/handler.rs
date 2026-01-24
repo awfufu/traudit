@@ -132,8 +132,25 @@ pub async fn handle_connection(
   if let Some(upstream_ver) = &service.upstream_proxy {
     // Resolve addresses
     let src_addr = SocketAddr::new(final_ip, final_port);
-    // Use extracted local_addr or fallback to physical_addr (server socket)
-    let dst_addr = local_addr_opt.unwrap_or(physical_addr);
+
+    // Determine destination address, fallback to localhost if unknown.
+    let mut dst_addr = local_addr_opt.unwrap_or_else(|| {
+      if let Ok(addr) = listen_addr.parse::<SocketAddr>() {
+        addr
+      } else {
+        // Last resort fallback
+        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0)
+      }
+    });
+
+    // If destination is unspecified (0.0.0.0), replace with localhost to be valid
+    if dst_addr.ip().is_unspecified() {
+      let new_ip = match dst_addr.ip() {
+        IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+      };
+      dst_addr = SocketAddr::new(new_ip, dst_addr.port());
+    }
 
     let version = match upstream_ver.as_str() {
       "v1" => protocol::Version::V1,
