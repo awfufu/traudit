@@ -280,7 +280,7 @@ pub fn generate_cert() -> CertBundle {
   let certified_key = generate_simple_self_signed(subject_alt_names).unwrap();
   CertBundle {
     cert_pem: certified_key.cert.pem(),
-    key_pem: certified_key.key_pair.serialize_pem(),
+    key_pem: certified_key.signing_key.serialize_pem(),
   }
 }
 

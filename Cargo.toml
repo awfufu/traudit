@@ -1,6 +1,6 @@
 [package]
 name = "traudit"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 authors = ["awfufu"]
 description = "A reverse proxy that streams audit records directly to databases."
@@ -39,14 +39,14 @@ static-musl = ["openssl/vendored"]
 tempfile = "3"
 reqwest = { version = "0.12", features = ["rustls-tls", "stream", "trust-dns"] }
 clickhouse = { version = "0.14", features = ["time"] }
-rcgen = "0.13"
+rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2.1"
-rand = "0.8"
-testcontainers = "0.23"
+rand = "0.9"
+testcontainers = "0.26"
 once_cell = "1.19"
-ctor = "0.2"
+ctor = "0.6"
 
 [profile.release]
 opt-level = 3
