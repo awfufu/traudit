@@ -100,10 +100,18 @@ pub async fn bind_listener(
     use std::net::SocketAddr;
     // AsRawFd removed
 
-    let addr: SocketAddr = addr_str.parse().map_err(|e: std::net::AddrParseError| {
-      error!("[{}] invalid address {}: {}", service_name, addr_str, e);
-      anyhow::anyhow!(e)
-    })?;
+    let normalized_addr = if addr_str.starts_with(":::") {
+      format!("[::]:{}", &addr_str[3..])
+    } else {
+      addr_str.to_string()
+    };
+
+    let addr: SocketAddr = normalized_addr
+      .parse()
+      .map_err(|e: std::net::AddrParseError| {
+        error!("[{}] invalid address {}: {}", service_name, addr_str, e);
+        anyhow::anyhow!(e)
+      })?;
 
     let domain = if addr.is_ipv4() {
       socket2::Domain::IPV4

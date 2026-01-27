@@ -132,7 +132,20 @@ async fn main() -> anyhow::Result<()> {
       match std::process::Command::new(&args[0])
         .args(&args[1..])
         .spawn() {
-          Ok(child) => info!("spawned new process with pid: {}", child.id()),
+          Ok(child) => {
+            let child_pid = child.id();
+            info!("spawned new process with pid: {}", child_pid);
+
+            // Notify systemd of NEW main PID so it doesn't kill the service when we exit
+            if let Ok(notify_socket) = std::env::var("NOTIFY_SOCKET") {
+              if let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() {
+                let msg = format!("MAINPID={}\n", child_pid);
+                if let Err(e) = sock.send_to(msg.as_bytes(), notify_socket) {
+                    error!("failed to send MAINPID to systemd: {}", e);
+                }
+              }
+            }
+          },
           Err(e) => error!("failed to spawn new process: {}", e),
       }
       // Initiate graceful shutdown for this process
