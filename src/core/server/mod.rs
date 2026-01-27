@@ -4,7 +4,6 @@ use crate::db::clickhouse::ClickHouseLogger;
 use pingora::apps::ServerApp;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Barrier};
-use tokio::signal;
 use tracing::{error, info};
 
 pub mod context;
@@ -17,7 +16,10 @@ use self::handler::handle_connection;
 use self::listener::{bind_listener, serve_listener_loop, UnifiedListener};
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 
-pub async fn run(config: Config) -> anyhow::Result<()> {
+pub async fn run(
+  config: Config,
+  shutdown_tx: tokio::sync::broadcast::Sender<()>,
+) -> anyhow::Result<()> {
   let db_logger = ClickHouseLogger::new(&config.database).map_err(|e| {
     error!("database: {}", e);
     e
@@ -160,8 +162,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         );
       }
 
-      let shutdown_dummy =
-        pingora::server::ShutdownWatch::from(tokio::sync::watch::channel(false).1);
+      let shutdown_rx = shutdown_tx.subscribe();
 
       if is_tcp_service {
         // --- TCP Handler (with startup check) ---
@@ -185,7 +186,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
           real_ip_config.clone(),
           proxy_proto_config,
           tls_acceptor,
-          shutdown_dummy,
+          shutdown_rx,
           move |stream, info, client_addr| {
             let db = db.clone();
             let svc = svc_cfg.clone();
@@ -226,13 +227,17 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         std::mem::forget(service_obj);
         let app = Arc::new(app);
 
+        // pass the REAL shutdown signal to serve_listener_loop.
+        let shutdown_dummy =
+          pingora::server::ShutdownWatch::from(tokio::sync::watch::channel(false).1);
+
         join_set.spawn(serve_listener_loop(
           listener,
           service_config,
           real_ip_config,
           proxy_proto_config,
           tls_acceptor,
-          shutdown_dummy.clone(),
+          shutdown_rx,
           move |stream, info, client_addr| {
             let app = app.clone();
             let shutdown = shutdown_dummy.clone();
@@ -323,15 +328,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
   }
 
-  match signal::ctrl_c().await {
-    Ok(()) => {
-      info!("shutdown signal received.");
-    }
-    Err(err) => {
-      error!("unable to listen for shutdown signal: {}", err);
+  // Wait for all server components to finish gracefully
+  while let Some(res) = join_set.join_next().await {
+    if let Err(e) = res {
+      error!("task panicked: {}", e);
     }
   }
 
-  join_set.shutdown().await;
+  info!("server components finished.");
   Ok(())
 }

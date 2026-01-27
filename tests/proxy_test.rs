@@ -302,7 +302,8 @@ async fn test_proxy_chain() {
   let res = prepare_chain_env().await;
 
   tokio::spawn(async move {
-    let _ = traudit::core::server::run(res.config).await;
+    let (tx, _rx) = tokio::sync::broadcast::channel(1);
+    let _ = traudit::core::server::run(res.config, tx).await;
   });
   tokio::time::sleep(Duration::from_millis(2000)).await;
 

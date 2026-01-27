@@ -4,6 +4,7 @@ use traudit::core;
 use anyhow::bail;
 use std::env;
 use std::path::Path;
+use tokio::signal;
 use tracing::{error, info};
 
 pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
@@ -106,9 +107,49 @@ async fn main() -> anyhow::Result<()> {
     return Ok(());
   }
 
-  if let Err(_e) = core::server::run(config).await {
-    std::process::exit(1);
+  // Create a channel to signal shutdown to the server component
+  let (shutdown_tx, _shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+  let shutdown_tx_clone = shutdown_tx.clone();
+
+  // Run server in a separate task
+  let server_handle = tokio::spawn(async move {
+    if let Err(e) = core::server::run(config, shutdown_tx_clone).await {
+      error!("server error: {}", e);
+      std::process::exit(1);
+    }
+  });
+
+  // Signal handling loop
+  let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())?;
+  let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())?;
+  let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+
+  tokio::select! {
+    _ = sighup.recv() => {
+      info!("received SIGHUP (reload). spawning new process...");
+      // Spawn new process
+      let args: Vec<String> = env::args().collect();
+      match std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .spawn() {
+          Ok(child) => info!("spawned new process with pid: {}", child.id()),
+          Err(e) => error!("failed to spawn new process: {}", e),
+      }
+      // Initiate graceful shutdown for this process
+      info!("shutting down old process gracefully...");
+    }
+    _ = sigint.recv() => {
+      info!("received SIGINT, shutdown...");
+    }
+    _ = sigterm.recv() => {
+      info!("received SIGTERM, shutdown...");
+    }
   }
 
+  // Send shutdown signal to server components
+  let _ = shutdown_tx.send(());
+
+  // Wait for server to finish (graceful drain)
+  let _ = server_handle.await;
   Ok(())
 }

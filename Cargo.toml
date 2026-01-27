@@ -30,6 +30,7 @@ httparse = "1.10.1"
 openssl = { version = "0.10" }
 serde_ignored = "0.1.14"
 tokio-openssl = "0.6"
+nix = { version = "0.31.1", features = ["signal", "process", "socket"] }
 
 [features]
 default = []

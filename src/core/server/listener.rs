@@ -4,7 +4,7 @@ use crate::core::server::stream::InboundStream;
 use bytes::BytesMut;
 use openssl::ssl::{Ssl, SslAcceptor};
 use pingora::protocols::l4::socket::SocketAddr;
-use pingora::server::ShutdownWatch;
+// ShutdownWatch removed
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -95,11 +95,61 @@ pub async fn bind_listener(
 
     Ok(UnifiedListener::Unix(listener, path_buf))
   } else {
-    // TCP
-    let listener = TcpListener::bind(addr_str).await.map_err(|e| {
+    // TCP with SO_REUSEPORT
+    use nix::sys::socket::{setsockopt, sockopt};
+    use std::net::SocketAddr;
+    // AsRawFd removed
+
+    let addr: SocketAddr = addr_str.parse().map_err(|e: std::net::AddrParseError| {
+      error!("[{}] invalid address {}: {}", service_name, addr_str, e);
+      anyhow::anyhow!(e)
+    })?;
+
+    let domain = if addr.is_ipv4() {
+      socket2::Domain::IPV4
+    } else {
+      socket2::Domain::IPV6
+    };
+
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None).map_err(|e| {
+      error!("[{}] failed to create socket: {}", service_name, e);
+      e
+    })?;
+
+    #[cfg(unix)]
+    {
+      if let Err(e) = setsockopt(&socket, sockopt::ReusePort, &true) {
+        warn!("[{}] failed to set SO_REUSEPORT: {}", service_name, e);
+      }
+      if let Err(e) = setsockopt(&socket, sockopt::ReuseAddr, &true) {
+        warn!("[{}] failed to set SO_REUSEADDR: {}", service_name, e);
+      }
+    }
+
+    socket.set_nonblocking(true)?;
+
+    // Convert std::net::SocketAddr to socket2::SockAddr
+    let sock_addr = socket2::SockAddr::from(addr);
+
+    socket.bind(&sock_addr).map_err(|e| {
       error!("[{}] failed to bind {}: {}", service_name, addr_str, e);
       e
     })?;
+
+    socket.listen(1024).map_err(|e| {
+      error!("[{}] failed to listen {}: {}", service_name, addr_str, e);
+      e
+    })?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    let listener = TcpListener::from_std(std_listener).map_err(|e| {
+      error!(
+        "[{}] failed to convert to tokio listener: {}",
+        service_name, e
+      );
+      e
+    })?;
+
     Ok(UnifiedListener::Tcp(listener))
   }
 }
@@ -110,7 +160,7 @@ pub async fn serve_listener_loop<F, Fut>(
   real_ip_config: Option<crate::config::RealIpConfig>,
   proxy_cfg: Option<String>,
   tls_acceptor: Option<Arc<SslAcceptor>>,
-  _shutdown: ShutdownWatch,
+  mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
   handler: F,
 ) where
   F: Fn(UnifiedPingoraStream, Option<crate::protocol::ProxyInfo>, std::net::SocketAddr) -> Fut
@@ -120,120 +170,169 @@ pub async fn serve_listener_loop<F, Fut>(
     + Clone,
   Fut: std::future::Future<Output = ()> + Send,
 {
+  use std::sync::atomic::{AtomicUsize, Ordering};
+
+  // Track active connections
+  let active_connections = Arc::new(AtomicUsize::new(0));
+  let notify_shutdown = Arc::new(tokio::sync::Notify::new());
+
   loop {
-    match listener.accept().await {
-      Ok((mut stream, client_addr)) => {
-        let proxy_cfg = proxy_cfg.clone();
-        let service = service.clone();
-        let real_ip_config = real_ip_config.clone();
-        let handler = handler.clone();
-        let tls_acceptor = tls_acceptor.clone();
+    tokio::select! {
+      _ = shutdown_rx.recv() => {
+        info!("[{}] shutdown signal received, stopping acceptance", service.name);
+        break;
+      }
+      accept_res = listener.accept() => {
+        match accept_res {
+          Ok((mut stream, client_addr)) => {
+            let proxy_cfg = proxy_cfg.clone();
+            let service = service.clone();
+            let real_ip_config = real_ip_config.clone();
+            let handler = handler.clone();
+            let tls_acceptor = tls_acceptor.clone();
 
-        tokio::spawn(async move {
-          let mut buffer = BytesMut::new();
-          let mut proxy_info = None;
+            // Increment counter
+            active_connections.fetch_add(1, Ordering::SeqCst);
+            let active_connections = active_connections.clone();
+            let notify_shutdown = notify_shutdown.clone();
 
-          // 1. Read PROXY header
-          if proxy_cfg.is_some() {
-            match crate::protocol::read_proxy_header(&mut stream).await {
-              Ok((info, buf)) => {
-                buffer = buf;
-                if let Some(info) = info {
-                  // Validate version
-                  let valid = match proxy_cfg.as_deref() {
-                    Some("v1") => info.version == crate::protocol::Version::V1,
-                    Some("v2") => info.version == crate::protocol::Version::V2,
-                    _ => true,
-                  };
-                  if !valid {
-                    warn!("[{}] proxy protocol version mismatch", service.name);
+            tokio::spawn(async move {
+              // Ensure we decrement on drop
+              struct ConnectionGuard {
+                counter: Arc<AtomicUsize>,
+                notify: Arc<tokio::sync::Notify>,
+              }
+              impl Drop for ConnectionGuard {
+                fn drop(&mut self) {
+                  let prev = self.counter.fetch_sub(1, Ordering::SeqCst);
+                  if prev == 1 {
+                    self.notify.notify_waiters();
                   }
-                  proxy_info = Some(info);
-                } else {
-                  let msg = format!("strict proxy protocol violation from {}", client_addr);
-                  error!("[{}] {}", service.name, msg);
-                  return; // Close connection
                 }
               }
-              Err(e) => {
-                error!("failed to read proxy header: {}", e);
-                return;
-              }
-            }
-          }
+              let _guard = ConnectionGuard {
+                counter: active_connections,
+                notify: notify_shutdown,
+              };
 
-          // 2. Resolve Real IP (consumes stream/buffer for XFF peeking if needed).
+              let mut buffer = BytesMut::new();
+              let mut proxy_info = None;
 
-          let (real_peer_ip, real_peer_port) = match crate::core::server::handler::resolve_real_ip(
-            &real_ip_config,
-            client_addr,
-            &proxy_info,
-            &mut stream,
-            &mut buffer,
-          )
-          .await
-          {
-            Ok((ip, port)) => (ip, port),
-            Err(e) => {
-              error!("[{}] real ip resolution failed: {}", service.name, e);
-              // Fallback or abort?
-              // Abort is safer if I/O broken.
-              return;
-            }
-          };
-
-          let local_addr = match &stream {
-            InboundStream::Tcp(s) => s.local_addr().ok(),
-            _ => None,
-          }
-          .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-
-          // 3. Construct base PingoraStream
-          let stream = PingoraStream::new(
-            stream,
-            buffer,
-            match SocketAddr::from(std::net::SocketAddr::new(real_peer_ip, real_peer_port)) {
-              SocketAddr::Inet(addr) => addr,
-              _ => unreachable!(),
-            },
-            match SocketAddr::from(local_addr) {
-              SocketAddr::Inet(addr) => addr,
-              _ => unreachable!(),
-            },
-          );
-
-          // 4. TLS Handshake if configured
-          let stream: UnifiedPingoraStream = if let Some(acceptor) = tls_acceptor {
-            match Ssl::new(acceptor.context()) {
-              Ok(ssl) => match SslStream::new(ssl, stream) {
-                Ok(mut ssl_stream) => match std::pin::Pin::new(&mut ssl_stream).accept().await {
-                  Ok(_) => UnifiedPingoraStream::Tls(PingoraTlsStream::new(ssl_stream)),
+              // 1. Read PROXY header
+              if proxy_cfg.is_some() {
+                match crate::protocol::read_proxy_header(&mut stream).await {
+                  Ok((info, buf)) => {
+                    buffer = buf;
+                    if let Some(info) = info {
+                      // Validate version
+                      let valid = match proxy_cfg.as_deref() {
+                        Some("v1") => info.version == crate::protocol::Version::V1,
+                        Some("v2") => info.version == crate::protocol::Version::V2,
+                        _ => true,
+                      };
+                      if !valid {
+                        warn!("[{}] proxy protocol version mismatch", service.name);
+                      }
+                      proxy_info = Some(info);
+                    } else {
+                      let msg = format!("strict proxy protocol violation from {}", client_addr);
+                      error!("[{}] {}", service.name, msg);
+                      return; // Close connection
+                    }
+                  }
                   Err(e) => {
-                    error!("[{}] tls handshake failed: {}", service.name, e);
+                    error!("failed to read proxy header: {}", e);
                     return;
                   }
-                },
+                }
+              }
+
+              // 2. Resolve Real IP (consumes stream/buffer for XFF peeking if needed).
+              let (real_peer_ip, real_peer_port) = match crate::core::server::handler::resolve_real_ip(
+                &real_ip_config,
+                client_addr,
+                &proxy_info,
+                &mut stream,
+                &mut buffer,
+              )
+              .await
+              {
+                Ok((ip, port)) => (ip, port),
                 Err(e) => {
-                  error!("[{}] failed to create ssl stream: {}", service.name, e);
+                  error!("[{}] real ip resolution failed: {}", service.name, e);
+                  // Fallback or abort?
+                  // Abort is safer if I/O broken.
                   return;
                 }
-              },
-              Err(e) => {
-                error!("[{}] failed to create ssl object: {}", service.name, e);
-                return;
-              }
-            }
-          } else {
-            UnifiedPingoraStream::Plain(stream)
-          };
+              };
 
-          // 5. Handler
-          handler(stream, proxy_info, client_addr).await;
-        });
-      }
-      Err(e) => {
-        error!("accept error: {}", e);
+              let local_addr = match &stream {
+                InboundStream::Tcp(s) => s.local_addr().ok(),
+                _ => None,
+              }
+              .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+
+              // 3. Construct base PingoraStream
+              let stream = PingoraStream::new(
+                stream,
+                buffer,
+                match SocketAddr::from(std::net::SocketAddr::new(real_peer_ip, real_peer_port)) {
+                  SocketAddr::Inet(addr) => addr,
+                  _ => unreachable!(),
+                },
+                match SocketAddr::from(local_addr) {
+                  SocketAddr::Inet(addr) => addr,
+                  _ => unreachable!(),
+                },
+              );
+
+              // 4. TLS Handshake if configured
+              let stream: UnifiedPingoraStream = if let Some(acceptor) = tls_acceptor {
+                match Ssl::new(acceptor.context()) {
+                  Ok(ssl) => match SslStream::new(ssl, stream) {
+                    Ok(mut ssl_stream) => match std::pin::Pin::new(&mut ssl_stream).accept().await {
+                      Ok(_) => UnifiedPingoraStream::Tls(PingoraTlsStream::new(ssl_stream)),
+                      Err(e) => {
+                        error!("[{}] tls handshake failed: {}", service.name, e);
+                        return;
+                      }
+                    },
+                    Err(e) => {
+                      error!("[{}] failed to create ssl stream: {}", service.name, e);
+                      return;
+                    }
+                  },
+                  Err(e) => {
+                    error!("[{}] failed to create ssl object: {}", service.name, e);
+                    return;
+                  }
+                }
+              } else {
+                UnifiedPingoraStream::Plain(stream)
+              };
+
+              // 5. Handler
+              handler(stream, proxy_info, client_addr).await;
+            });
+          }
+          Err(e) => {
+            error!("accept error: {}", e);
+          }
+        }
       }
     }
   }
+
+  // Graceful shutdown: wait for active connections
+  drop(listener); // Close socket immediately
+
+  if active_connections.load(Ordering::SeqCst) > 0 {
+    info!(
+      "[{}] waiting for {} active connections...",
+      service.name,
+      active_connections.load(Ordering::SeqCst)
+    );
+    notify_shutdown.notified().await;
+  }
+  info!("[{}] shutdown complete", service.name);
 }
