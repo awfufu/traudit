@@ -136,20 +136,18 @@ async fn main() -> anyhow::Result<()> {
           Err(e) => error!("failed to spawn new process: {}", e),
       }
       // Initiate graceful shutdown for this process
-      info!("shutting down old process gracefully...");
+      info!("shutting down old process gracefully (draining connections)...");
+      let _ = shutdown_tx.send(());
+      // Wait for server to finish (graceful drain)
+      let _ = server_handle.await;
     }
     _ = sigint.recv() => {
-      info!("received SIGINT, shutdown...");
+      info!("received SIGINT, exiting immediately...");
     }
     _ = sigterm.recv() => {
-      info!("received SIGTERM, shutdown...");
+      info!("received SIGTERM, exiting immediately...");
     }
   }
 
-  // Send shutdown signal to server components
-  let _ = shutdown_tx.send(());
-
-  // Wait for server to finish (graceful drain)
-  let _ = server_handle.await;
   Ok(())
 }

@@ -1,6 +1,6 @@
 [package]
 name = "traudit"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 authors = ["awfufu"]
 description = "A reverse proxy that streams audit records directly to databases."
