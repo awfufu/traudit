@@ -245,11 +245,9 @@ pub async fn handle_connection(
     bytes_recv,
   };
 
-  tokio::spawn(async move {
-    if let Err(e) = db.insert_log(log_entry).await {
-      error!("failed to insert tcp log: {}", e);
-    }
-  });
+  if let Err(e) = db.insert_log(log_entry).await {
+    error!("failed to insert tcp log: {}", e);
+  }
 
   Ok(total_bytes)
 }
