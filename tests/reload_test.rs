@@ -110,6 +110,8 @@ services:
     .arg("--")
     .arg("-f")
     .arg(&config_path)
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
     .spawn()?;
 
   // Give it time to start
