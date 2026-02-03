@@ -2,13 +2,12 @@ use crate::config::Config;
 use crate::core::upstream::UpstreamStream;
 use crate::db::clickhouse::ClickHouseLogger;
 use pingora::apps::ServerApp;
-use std::os::unix::fs::PermissionsExt;
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 use tracing::{error, info};
 
 pub mod context;
 pub mod handler;
-mod listener;
+pub mod listener;
 mod pingora_compat;
 pub mod stream;
 
@@ -37,10 +36,8 @@ pub async fn run(
     return Err(e);
   }
 
+  // JoinSet to manage all server tasks
   let mut join_set = tokio::task::JoinSet::new();
-
-  // Pingora server initialization (TLS only or Standard HTTP)
-  let mut pingora_services = Vec::new();
 
   for service in config.services {
     let db = db.clone();
@@ -51,26 +48,9 @@ pub async fn run(
       let mode = bind.mode;
       let real_ip_config = bind.real_ip.clone();
 
-      // Use custom loop for TCP services or HTTP services requiring PROXY protocol parsing (not fully supported by pingora standard loop).
-
       let is_tcp_service = service.service_type == "tcp";
-      // Use custom loop if Proxy Protocol is enabled, even if TLS is used
-      let is_http_proxy = service.service_type == "http" && bind.proxy.is_some();
 
-      let use_custom_loop = is_tcp_service || is_http_proxy;
-
-      if !use_custom_loop {
-        // Use Standard Pingora Service (For TLS, or Pure HTTP, or Unix HTTP without PROXY)
-        pingora_services.push((
-          service_config,
-          bind.clone(),
-          bind.tls.clone(),
-          real_ip_config,
-        ));
-        continue;
-      }
-
-      // --- Custom Loop Logic ---
+      // Custom Loop
 
       let mut tls_acceptor = None;
       if let Some(tls_config) = &bind.tls {
@@ -91,7 +71,7 @@ pub async fn run(
             error!("failed to load cert chain {}: {}", tls_config.cert, e);
             anyhow::anyhow!(e)
           })?;
-        // ALPN support matching Pingora's defaults?
+        // ALPN support matching Pingora's defaults
         acceptor.set_alpn_protos(b"\x02h2\x08http/1.1").ok();
         tls_acceptor = Some(Arc::new(acceptor.build()));
       }
@@ -150,14 +130,14 @@ pub async fn run(
         format!(" {}", tags.join(" "))
       };
 
-      if is_http_proxy {
+      if is_tcp_service {
         info!(
-          "[{}] listening on http {} {}{}",
+          "[{}] listening on {} {}{}",
           service_config.name, listen_type, bind_addr, tag_str
         );
       } else {
         info!(
-          "[{}] listening on {} {}{}",
+          "[{}] listening on http {} {}{}",
           service_config.name, listen_type, bind_addr, tag_str
         );
       }
@@ -260,61 +240,6 @@ pub async fn run(
         ));
       }
     }
-  }
-
-  // Run Pingora in a separate thread if needed
-  if !pingora_services.is_empty() {
-    let barrier = Arc::new(Barrier::new(2));
-    let barrier_clone = barrier.clone();
-
-    std::thread::spawn(move || {
-      use crate::core::pingora_proxy::TrauditProxy;
-      use pingora::proxy::http_proxy_service;
-      use pingora::server::configuration::Opt;
-      use pingora::server::Server;
-
-      if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut server = Server::new(Some(Opt::default())).unwrap();
-        server.bootstrap();
-
-        for (svc_config, bind, tls, real_ip) in pingora_services {
-          let proxy = TrauditProxy {
-            db: db.clone(),
-            service_config: svc_config.clone(),
-            listen_addr: bind.addr.clone(),
-            real_ip,
-            add_xff_header: bind.add_xff_header,
-          };
-
-          let mut service = http_proxy_service(&server.configuration, proxy);
-
-          if let Some(tls_config) = tls {
-            let key_path = tls_config.key.as_deref().unwrap_or(&tls_config.cert);
-            service
-              .add_tls(&bind.addr, &tls_config.cert, key_path)
-              .unwrap();
-            info!("[{}] listening on https {}", svc_config.name, bind.addr);
-          } else if bind.addr.starts_with("unix://") {
-            let path = bind.addr.trim_start_matches("unix://");
-            service.add_uds(path, Some(std::fs::Permissions::from_mode(bind.mode)));
-            info!("[{}] listening on http unix {}", svc_config.name, path);
-          } else {
-            service.add_tcp(&bind.addr);
-            info!("[{}] listening on http {}", svc_config.name, bind.addr);
-          }
-
-          server.add_service(service);
-        }
-
-        barrier_clone.wait();
-        server.run_forever();
-      })) {
-        error!("pingora server panicked: {:?}", e);
-      }
-      error!("pingora server exited unexpectedly!");
-    });
-
-    barrier.wait();
   }
 
   info!("traudit started...");

@@ -127,11 +127,40 @@ async fn main() -> anyhow::Result<()> {
   tokio::select! {
     _ = sighup.recv() => {
       info!("received SIGHUP (reload). spawning new process...");
+
+      // Prepare FDs to pass
+      let fd_map = {
+          let registry = traudit::core::server::listener::get_fd_registry().lock().unwrap();
+          registry.clone()
+      };
+
+      let fd_json = serde_json::to_string(&fd_map).unwrap_or_default();
+      info!("passing fds: {}", fd_json);
+
       // Spawn new process
       let args: Vec<String> = env::args().collect();
-      match std::process::Command::new(&args[0])
-        .args(&args[1..])
-        .spawn() {
+      let mut cmd = std::process::Command::new(&args[0]);
+      cmd.args(&args[1..]);
+      cmd.env("TRAUDIT_INHERITED_FDS", fd_json);
+
+      unsafe {
+          // Use pre_exec to clear CLOEXEC on the FDs to be inherited.
+          let fd_map_for_closure = fd_map.clone();
+
+          use std::os::unix::process::CommandExt;
+          cmd.pre_exec(move || {
+              for (_, &fd) in &fd_map_for_closure {
+                  // Clear FD_CLOEXEC flag
+                  let flags = libc::fcntl(fd, libc::F_GETFD);
+                  if flags >= 0 {
+                      libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                  }
+              }
+              Ok(())
+          });
+      }
+
+      match cmd.spawn() {
           Ok(child) => {
             let child_pid = child.id();
             info!("spawned new process with pid: {}", child_pid);

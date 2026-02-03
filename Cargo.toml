@@ -1,6 +1,6 @@
 [package]
 name = "traudit"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2021"
 authors = ["awfufu"]
 description = "A reverse proxy that streams audit records directly to databases."
@@ -12,6 +12,7 @@ tokio = { version = "1", features = ["full"] }
 clickhouse = { version = "0.14", features = ["time"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+serde_json = "1"
 http = "1"
 socket2 = "0.6"
 libc = "0.2"
@@ -30,7 +31,7 @@ httparse = "1.10.1"
 openssl = { version = "0.10" }
 serde_ignored = "0.1.14"
 tokio-openssl = "0.6"
-nix = { version = "0.31.1", features = ["signal", "process", "socket"] }
+nix = { version = "0.31.1", features = ["signal", "process", "socket", "fs"] }
 
 [features]
 default = []

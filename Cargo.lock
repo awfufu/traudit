@@ -3887,7 +3887,7 @@ dependencies = [
 
 [[package]]
 name = "traudit"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3909,6 +3909,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_ignored",
+ "serde_json",
  "serde_repr",
  "serde_yaml 0.9.34+deprecated",
  "socket2",

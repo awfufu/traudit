@@ -4,7 +4,6 @@ use crate::core::server::stream::InboundStream;
 use bytes::BytesMut;
 use openssl::ssl::{Ssl, SslAcceptor};
 use pingora::protocols::l4::socket::SocketAddr;
-// ShutdownWatch removed
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,12 +45,52 @@ impl UnifiedListener {
   }
 }
 
+// Global registry for FDs to be passed during reload
+pub static FD_REGISTRY: std::sync::OnceLock<
+  std::sync::Mutex<std::collections::HashMap<String, std::os::unix::io::RawFd>>,
+> = std::sync::OnceLock::new();
+
+pub fn get_fd_registry(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::os::unix::io::RawFd>> {
+  FD_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 pub async fn bind_listener(
   addr_str: &str,
   mode: u32,
   service_name: &str,
 ) -> anyhow::Result<UnifiedListener> {
-  if let Some(path) = addr_str.strip_prefix("unix://") {
+  use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+
+  // Check if we inherited an FD for this service
+  let inherited_fds_json = std::env::var("TRAUDIT_INHERITED_FDS").ok();
+  let mut inherited_fd: Option<RawFd> = None;
+
+  if let Some(json) = inherited_fds_json {
+    let map: std::collections::HashMap<String, RawFd> =
+      serde_json::from_str(&json).unwrap_or_default();
+    if let Some(&fd) = map.get(service_name) {
+      info!("[{}] inherited fd: {}", service_name, fd);
+      inherited_fd = Some(fd);
+    }
+  }
+
+  let listener = if let Some(fd) = inherited_fd {
+    // Determine type based on address string prefix
+    if addr_str.starts_with("unix://") {
+      let l = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+      // We must set it non-blocking as tokio expects
+      l.set_nonblocking(true)?;
+      let l = UnixListener::from_std(l)?;
+      let path = std::path::PathBuf::from(addr_str.trim_start_matches("unix://"));
+      UnifiedListener::Unix(l, path)
+    } else {
+      let l = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+      l.set_nonblocking(true)?;
+      let l = TcpListener::from_std(l)?;
+      UnifiedListener::Tcp(l)
+    }
+  } else if let Some(path) = addr_str.strip_prefix("unix://") {
     // Robust bind logic adapted from previous implementation
     let path_buf = std::path::Path::new(path).to_path_buf();
 
@@ -93,7 +132,7 @@ pub async fn bind_listener(
       }
     }
 
-    Ok(UnifiedListener::Unix(listener, path_buf))
+    UnifiedListener::Unix(listener, path_buf)
   } else {
     // TCP with SO_REUSEPORT
     use nix::sys::socket::{setsockopt, sockopt};
@@ -158,8 +197,41 @@ pub async fn bind_listener(
       e
     })?;
 
-    Ok(UnifiedListener::Tcp(listener))
+    UnifiedListener::Tcp(listener)
+  };
+
+  // Register duplicated FD for reload to pass to the next process.
+  let raw_fd = match &listener {
+    UnifiedListener::Tcp(l) => l.as_raw_fd(),
+    UnifiedListener::Unix(l, _) => l.as_raw_fd(),
+  };
+
+  // Use libc for dup to avoid nix version issues
+  let dup_fd = unsafe { libc::dup(raw_fd) };
+  if dup_fd < 0 {
+    let err = std::io::Error::last_os_error();
+    error!("failed to dup fd: {}", err);
+    return Err(anyhow::anyhow!(err));
   }
+
+  // Set CLOEXEC on the dup_fd
+  let flags = unsafe { libc::fcntl(dup_fd, libc::F_GETFD) };
+  if flags < 0 {
+    let _ = unsafe { libc::close(dup_fd) };
+    return Err(anyhow::anyhow!(std::io::Error::last_os_error()));
+  }
+
+  if unsafe { libc::fcntl(dup_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+    let _ = unsafe { libc::close(dup_fd) };
+    return Err(anyhow::anyhow!(std::io::Error::last_os_error()));
+  }
+
+  get_fd_registry()
+    .lock()
+    .unwrap()
+    .insert(service_name.to_string(), dup_fd);
+
+  Ok(listener)
 }
 
 pub async fn serve_listener_loop<F, Fut>(
