@@ -32,5 +32,5 @@ See [config_example.yaml](config_example.yaml).
     - [ ] SQLite/MySQL Adapters (Future)
 - [ ] Documentation & Testing
     - [x] Basic End-to-end tests
-    - [ ] Comprehensive Unit Tests
+    - [x] Comprehensive Unit Tests
     - [ ] Deployment Guide

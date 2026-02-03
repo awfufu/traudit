@@ -102,6 +102,14 @@ services:
   let config_path = std::env::temp_dir().join("stress_test.yaml");
   std::fs::write(&config_path, config_content)?;
 
+  // Pre-build to ensure cargo run doesn't time out compiling
+  let _ = Command::new("cargo")
+    .arg("build")
+    .arg("--bin")
+    .arg("traudit")
+    .status()
+    .await?;
+
   // Start Traudit using cargo run to ensure correct binary execution
   let mut _child = Command::new("cargo")
     .arg("run")
@@ -114,8 +122,21 @@ services:
     .stderr(std::process::Stdio::null())
     .spawn()?;
 
-  // Give it time to start
-  tokio::time::sleep(Duration::from_secs(5)).await;
+  // Wait for port to be open (up to 30s)
+  let addr = format!("127.0.0.1:{}", t_tcp_port);
+  let mut started = false;
+  for _ in 0..60 {
+    // 30s total (500ms * 60)
+    if TcpStream::connect(&addr).await.is_ok() {
+      started = true;
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+  }
+
+  if !started {
+    panic!("Traudit failed to start on port {} within 30s", t_tcp_port);
+  }
 
   // Run Test Loop for 10 seconds generating mixed traffic
 
