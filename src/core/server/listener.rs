@@ -328,22 +328,45 @@ pub async fn serve_listener_loop<F, Fut>(
               }
 
               // 2. Resolve Real IP (consumes stream/buffer for XFF peeking if needed).
-              let (real_peer_ip, real_peer_port) = match crate::core::server::handler::resolve_real_ip(
-                &real_ip_config,
-                client_addr,
-                &proxy_info,
-                &mut stream,
-                &mut buffer,
-              )
-              .await
-              {
-                Ok((ip, port)) => (ip, port),
-                Err(e) => {
-                  error!("[{}] real ip resolution failed: {}", service.name, e);
-                  // Fallback or abort?
-                  // Abort is safer if I/O broken.
-                  return;
-                }
+              // [FIX] If TLS is enabled, we CANNOT peek for XFF headers on the raw stream because it's encrypted.
+              // In that case, we skip XFF resolution here and let the proxy application (Pingora) handle it
+              // after decryption (though Pingora might need its own config for that).
+              // For now, avoiding the deadlock is priority.
+              let perform_xff = if tls_acceptor.is_some() {
+                 if let Some(ref cfg) = real_ip_config {
+                    // If source is Xff, we must skip.
+                    // If source is ProxyProtocol, we can still do it (already done via proxy_info above).
+                    cfg.source != crate::config::RealIpSource::Xff
+                 } else {
+                    true
+                 }
+              } else {
+                 true
+              };
+
+              let (real_peer_ip, real_peer_port) = if perform_xff {
+                  match crate::core::server::handler::resolve_real_ip(
+                    &real_ip_config,
+                    client_addr,
+                    &proxy_info,
+                    &mut stream,
+                    &mut buffer,
+                  )
+                  .await
+                  {
+                    Ok((ip, port)) => (ip, port),
+                    Err(e) => {
+                      error!("[{}] real ip resolution failed: {}", service.name, e);
+                      return;
+                    }
+                  }
+              } else {
+                 // Fallback to what we know (Proxy Protocol or Physical)
+                 if let Some(info) = &proxy_info {
+                   (info.source.ip(), info.source.port())
+                 } else {
+                   (client_addr.ip(), client_addr.port())
+                 }
               };
 
               let local_addr = match &stream {

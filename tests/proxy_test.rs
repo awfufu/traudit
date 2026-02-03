@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+
 use traudit::config::{
   BindEntry, Config, DatabaseConfig, RealIpConfig, RealIpSource, ServiceConfig,
 };
@@ -165,6 +165,7 @@ async fn test_https_v2_append_xff() {
 }
 
 // Helper for Chain Test
+// Helper for Chain Test
 struct ChainTestResources {
   config: Config,
   e1_addr: String,
@@ -176,26 +177,12 @@ async fn prepare_chain_env() -> ChainTestResources {
   // E4 Upstream (Mock Server)
   let (e4_upstream_addr, _) = spawn_mock_upstream().await;
 
-  // Assign ports dynamically
-  let l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let p1 = l1.local_addr().unwrap().port();
-  let addr1 = format!("127.0.0.1:{}", p1);
-  drop(l1);
-
-  let l2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let p2 = l2.local_addr().unwrap().port();
-  let addr2 = format!("127.0.0.1:{}", p2);
-  drop(l2);
-
-  let l3 = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let p3 = l3.local_addr().unwrap().port();
-  let addr3 = format!("127.0.0.1:{}", p3);
-  drop(l3);
-
-  let l4 = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let p4 = l4.local_addr().unwrap().port();
-  let addr4 = format!("127.0.0.1:{}", p4);
-  drop(l4);
+  // Use Unix sockets to avoid port collisions/stealing
+  let suffix = rand::random::<u64>();
+  let addr1 = format!("unix:///tmp/traudit_e1_{}.sock", suffix);
+  let addr2 = format!("unix:///tmp/traudit_e2_{}.sock", suffix);
+  let addr3 = format!("unix:///tmp/traudit_e3_{}.sock", suffix);
+  let addr4 = format!("unix:///tmp/traudit_e4_{}.sock", suffix);
 
   // DB Config
   let db_port = get_shared_db_port().await;
@@ -307,8 +294,9 @@ async fn test_proxy_chain() {
   });
   tokio::time::sleep(Duration::from_millis(2000)).await;
 
-  // Connect to E1
-  let mut stream = TcpStream::connect(&res.e1_addr)
+  // Connect to E1 (Unix)
+  let path = res.e1_addr.strip_prefix("unix://").unwrap();
+  let mut stream = tokio::net::UnixStream::connect(path)
     .await
     .expect("Failed to connect to E1");
 
@@ -325,4 +313,8 @@ async fn test_proxy_chain() {
     response, b"chain_test_ping",
     "Chain test failed: response mismatch"
   );
+
+  // Cleanup E1 socket (others are cleaned up by server, but E1 we explicitly connected to)
+  // Actually all are cleaned up by server::run when it drops listener.
+  // We don't need manual cleanup here unless we want to be pedantic.
 }
