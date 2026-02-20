@@ -1,4 +1,5 @@
 use serde::{Deserialize, Deserializer};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::Path;
 use tokio::fs;
@@ -254,7 +255,15 @@ impl Config {
   }
 
   pub fn validate(&self) -> anyhow::Result<()> {
+    let mut seen_service_names = HashSet::new();
     for service in &self.services {
+      if !seen_service_names.insert(service.name.as_str()) {
+        anyhow::bail!(
+          "duplicate service name '{}' found. Service names must be unique.",
+          service.name
+        );
+      }
+
       let needs_backend = match service.service_type.as_str() {
         "tcp" => true,
         "http" => service.binds.iter().any(|b| !b.redirect_https.enabled),
@@ -528,6 +537,34 @@ services:
 
     let err = Config::load(&path).await.unwrap_err();
     assert!(err.to_string().contains("Expected 3xx status code"));
+  }
+
+  #[tokio::test]
+  async fn test_duplicate_service_names_not_allowed() {
+    let config_str = r#"
+database:
+  type: clickhouse
+  dsn: "clickhouse://admin:password@127.0.0.1:8123/audit_db"
+
+services:
+  - name: "dup"
+    type: "tcp"
+    forward_to: "127.0.0.1:22"
+    binds:
+      - addr: "0.0.0.0:2201"
+
+  - name: "dup"
+    type: "tcp"
+    forward_to: "127.0.0.1:22"
+    binds:
+      - addr: "0.0.0.0:2202"
+"#;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    write!(file, "{}", config_str).unwrap();
+    let path = file.path().to_path_buf();
+
+    let err = Config::load(&path).await.unwrap_err();
+    assert!(err.to_string().contains("duplicate service name"));
   }
 
   #[test]
