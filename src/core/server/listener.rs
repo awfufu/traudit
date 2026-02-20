@@ -11,6 +11,34 @@ use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio_openssl::SslStream;
 use tracing::{error, info, warn};
 
+fn normalize_ipv4_mapped_addr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+  match addr {
+    std::net::SocketAddr::V6(v6) => {
+      if let Some(v4) = v6.ip().to_ipv4_mapped() {
+        std::net::SocketAddr::new(std::net::IpAddr::V4(v4), v6.port())
+      } else {
+        std::net::SocketAddr::V6(v6)
+      }
+    }
+    other => other,
+  }
+}
+
+fn parse_tcp_bind_target(addr_str: &str) -> anyhow::Result<(std::net::SocketAddr, Option<bool>)> {
+  let (normalized_addr, force_v6_only) = if let Some(port) = addr_str.strip_prefix(":::") {
+    (format!("[::]:{}", port), Some(true))
+  } else if let Some(port) = addr_str.strip_prefix(":") {
+    (format!("[::]:{}", port), Some(false))
+  } else if let Some(port) = addr_str.strip_prefix("*:") {
+    (format!("[::]:{}", port), Some(false))
+  } else {
+    (addr_str.to_string(), None)
+  };
+
+  let addr: std::net::SocketAddr = normalized_addr.parse()?;
+  Ok((addr, force_v6_only))
+}
+
 pub enum UnifiedListener {
   Tcp(TcpListener),
   Unix(UnixListener, PathBuf), // PathBuf for cleanup on Drop
@@ -30,7 +58,7 @@ impl UnifiedListener {
     match self {
       UnifiedListener::Tcp(l) => {
         let (stream, addr) = l.accept().await?;
-        Ok((InboundStream::Tcp(stream), addr))
+        Ok((InboundStream::Tcp(stream), normalize_ipv4_mapped_addr(addr)))
       }
       UnifiedListener::Unix(l, _) => {
         let (stream, _addr) = l.accept().await?;
@@ -136,21 +164,12 @@ pub async fn bind_listener(
   } else {
     // TCP with SO_REUSEPORT
     use nix::sys::socket::{setsockopt, sockopt};
-    use std::net::SocketAddr;
     // AsRawFd removed
 
-    let normalized_addr = if addr_str.starts_with(":::") {
-      format!("[::]:{}", &addr_str[3..])
-    } else {
-      addr_str.to_string()
-    };
-
-    let addr: SocketAddr = normalized_addr
-      .parse()
-      .map_err(|e: std::net::AddrParseError| {
-        error!("[{}] invalid address {}: {}", service_name, addr_str, e);
-        anyhow::anyhow!(e)
-      })?;
+    let (addr, force_v6_only) = parse_tcp_bind_target(addr_str).map_err(|e| {
+      error!("[{}] invalid address {}: {}", service_name, addr_str, e);
+      e
+    })?;
 
     let domain = if addr.is_ipv4() {
       socket2::Domain::IPV4
@@ -170,6 +189,18 @@ pub async fn bind_listener(
       }
       if let Err(e) = setsockopt(&socket, sockopt::ReuseAddr, &true) {
         warn!("[{}] failed to set SO_REUSEADDR: {}", service_name, e);
+      }
+    }
+
+    if addr.is_ipv6() {
+      if let Some(v6_only) = force_v6_only {
+        socket.set_only_v6(v6_only).map_err(|e| {
+          error!(
+            "[{}] failed to configure IPV6_V6ONLY={} for {}: {}",
+            service_name, v6_only, addr_str, e
+          );
+          e
+        })?;
       }
     }
 
@@ -232,6 +263,44 @@ pub async fn bind_listener(
     .insert(service_name.to_string(), dup_fd);
 
   Ok(listener)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{normalize_ipv4_mapped_addr, parse_tcp_bind_target};
+  use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+  #[test]
+  fn test_parse_tcp_bind_target_rules() {
+    let (a, v6_only) = parse_tcp_bind_target("0.0.0.0:80").unwrap();
+    assert_eq!(a, "0.0.0.0:80".parse::<SocketAddr>().unwrap());
+    assert_eq!(v6_only, None);
+
+    let (a, v6_only) = parse_tcp_bind_target(":::80").unwrap();
+    assert_eq!(a, "[::]:80".parse::<SocketAddr>().unwrap());
+    assert_eq!(v6_only, Some(true));
+
+    let (a, v6_only) = parse_tcp_bind_target(":80").unwrap();
+    assert_eq!(a, "[::]:80".parse::<SocketAddr>().unwrap());
+    assert_eq!(v6_only, Some(false));
+
+    let (a, v6_only) = parse_tcp_bind_target("*:80").unwrap();
+    assert_eq!(a, "[::]:80".parse::<SocketAddr>().unwrap());
+    assert_eq!(v6_only, Some(false));
+  }
+
+  #[test]
+  fn test_normalize_ipv4_mapped_addr() {
+    let mapped = SocketAddr::new(
+      IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xFFFF, 0xC000, 0x0280)),
+      8080,
+    );
+    let normalized = normalize_ipv4_mapped_addr(mapped);
+    assert_eq!(normalized, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 128)), 8080));
+
+    let normal_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080);
+    assert_eq!(normalize_ipv4_mapped_addr(normal_v6), normal_v6);
+  }
 }
 
 pub async fn serve_listener_loop<F, Fut>(
