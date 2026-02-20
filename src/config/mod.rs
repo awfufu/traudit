@@ -39,9 +39,71 @@ pub struct ServiceConfig {
   pub service_type: String,
   pub binds: Vec<BindEntry>,
   #[serde(rename = "forward_to")]
-  pub forward_to: String,
+  pub forward_to: Option<String>,
   #[serde(rename = "upstream_proxy")]
   pub upstream_proxy: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RedirectHttpsConfig {
+  pub enabled: bool,
+  pub code: u16,
+  pub port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct RedirectHttpsConfigObject {
+  enabled: bool,
+  #[serde(default = "default_redirect_code")]
+  code: u16,
+  #[serde(default = "default_redirect_port")]
+  port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RedirectHttpsConfigRaw {
+  Bool(bool),
+  Object(RedirectHttpsConfigObject),
+}
+
+impl Default for RedirectHttpsConfig {
+  fn default() -> Self {
+    Self {
+      enabled: false,
+      code: default_redirect_code(),
+      port: default_redirect_port(),
+    }
+  }
+}
+
+impl<'de> Deserialize<'de> for RedirectHttpsConfig {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let raw = RedirectHttpsConfigRaw::deserialize(deserializer)?;
+    Ok(match raw {
+      RedirectHttpsConfigRaw::Bool(enabled) => Self {
+        enabled,
+        code: default_redirect_code(),
+        port: default_redirect_port(),
+      },
+      RedirectHttpsConfigRaw::Object(obj) => Self {
+        enabled: obj.enabled,
+        code: obj.code,
+        port: obj.port,
+      },
+    })
+  }
+}
+
+fn default_redirect_code() -> u16 {
+  308
+}
+
+fn default_redirect_port() -> u16 {
+  443
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -103,6 +165,8 @@ pub struct BindEntry {
   pub tls: Option<TlsConfig>,
   #[serde(default)]
   pub add_xff_header: bool,
+  #[serde(default)]
+  pub redirect_https: RedirectHttpsConfig,
   pub real_ip: Option<RealIpConfig>,
 }
 
@@ -191,7 +255,48 @@ impl Config {
 
   pub fn validate(&self) -> anyhow::Result<()> {
     for service in &self.services {
+      let needs_backend = match service.service_type.as_str() {
+        "tcp" => true,
+        "http" => service.binds.iter().any(|b| !b.redirect_https.enabled),
+        _ => true,
+      };
+
+      if needs_backend && service.forward_to.is_none() {
+        anyhow::bail!(
+          "Service '{}' requires 'forward_to'. For type '{}' this is required unless all HTTP binds are redirect-only.",
+          service.name,
+          service.service_type
+        );
+      }
+
       for bind in &service.binds {
+        if bind.redirect_https.enabled {
+          if service.service_type != "http" {
+            anyhow::bail!(
+              "Service '{}' bind '{}' enables 'redirect_https', but this is only valid for type 'http'.",
+              service.name,
+              bind.addr
+            );
+          }
+
+          if bind.tls.is_some() {
+            anyhow::bail!(
+              "Service '{}' bind '{}' enables 'redirect_https' and 'tls' together. Redirect-to-HTTPS must be configured on non-TLS HTTP binds.",
+              service.name,
+              bind.addr
+            );
+          }
+
+          if !(300..=399).contains(&bind.redirect_https.code) {
+            anyhow::bail!(
+              "Service '{}' bind '{}' has invalid 'redirect_https.code' {}. Expected 3xx status code.",
+              service.name,
+              bind.addr,
+              bind.redirect_https.code
+            );
+          }
+        }
+
         if let Some(real_ip) = &bind.real_ip {
           // Rule 1: TCP services cannot use XFF as they don't parse HTTP headers
           if service.service_type == "tcp" && real_ip.source == RealIpSource::Xff {
@@ -227,6 +332,13 @@ impl Config {
       }
 
       if let Some(upstream_proxy) = &service.upstream_proxy {
+        if service.forward_to.is_none() {
+          anyhow::bail!(
+            "Service '{}' sets 'upstream_proxy' but has no 'forward_to'.",
+            service.name
+          );
+        }
+
         match upstream_proxy.as_str() {
           "v1" | "v2" => {},
           other => anyhow::bail!(
@@ -277,8 +389,145 @@ services:
     assert_eq!(config.services[0].name, "ssh-prod");
     assert_eq!(config.services[0].binds[0].addr, "0.0.0.0:22222");
     assert_eq!(config.services[0].binds[0].proxy, Some("v2".to_string()));
-    assert_eq!(config.services[0].forward_to, "127.0.0.1:22");
+    assert_eq!(config.services[0].forward_to, Some("127.0.0.1:22".to_string()));
     assert_eq!(config.services[0].upstream_proxy, None);
+  }
+
+  #[test]
+  fn test_redirect_https_bool_and_object() {
+    #[derive(Deserialize)]
+    struct TestBind {
+      #[serde(default)]
+      redirect_https: RedirectHttpsConfig,
+    }
+
+    let yaml_bool = "redirect_https: true";
+    let bind_bool: TestBind = serde_yaml::from_str(yaml_bool).unwrap();
+    assert!(bind_bool.redirect_https.enabled);
+    assert_eq!(bind_bool.redirect_https.code, 308);
+    assert_eq!(bind_bool.redirect_https.port, 443);
+
+    let yaml_obj = "redirect_https:\n  enabled: true\n  code: 301\n  port: 8443\n";
+    let bind_obj: TestBind = serde_yaml::from_str(yaml_obj).unwrap();
+    assert!(bind_obj.redirect_https.enabled);
+    assert_eq!(bind_obj.redirect_https.code, 301);
+    assert_eq!(bind_obj.redirect_https.port, 8443);
+  }
+
+  #[tokio::test]
+  async fn test_http_redirect_only_can_omit_forward_to() {
+    let config_str = r#"
+database:
+  type: clickhouse
+  dsn: "clickhouse://admin:password@127.0.0.1:8123/audit_db"
+
+services:
+  - name: "redirect-only"
+    type: "http"
+    binds:
+      - addr: "0.0.0.0:80"
+        redirect_https: true
+"#;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    write!(file, "{}", config_str).unwrap();
+    let path = file.path().to_path_buf();
+
+    let config = Config::load(&path).await.expect("Failed to load config");
+    assert_eq!(config.services[0].forward_to, None);
+  }
+
+  #[tokio::test]
+  async fn test_http_non_redirect_bind_requires_forward_to() {
+    let config_str = r#"
+database:
+  type: clickhouse
+  dsn: "clickhouse://admin:password@127.0.0.1:8123/audit_db"
+
+services:
+  - name: "http-no-backend"
+    type: "http"
+    binds:
+      - addr: "0.0.0.0:8080"
+"#;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    write!(file, "{}", config_str).unwrap();
+    let path = file.path().to_path_buf();
+
+    let err = Config::load(&path).await.unwrap_err();
+    assert!(err.to_string().contains("requires 'forward_to'"));
+  }
+
+  #[tokio::test]
+  async fn test_redirect_https_rejects_tls_same_bind() {
+    let config_str = r#"
+database:
+  type: clickhouse
+  dsn: "clickhouse://admin:password@127.0.0.1:8123/audit_db"
+
+services:
+  - name: "bad-redirect-tls"
+    type: "http"
+    binds:
+      - addr: "0.0.0.0:443"
+        tls:
+          cert: "/tmp/cert.pem"
+          key: "/tmp/key.pem"
+        redirect_https: true
+    forward_to: "127.0.0.1:8080"
+"#;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    write!(file, "{}", config_str).unwrap();
+    let path = file.path().to_path_buf();
+
+    let err = Config::load(&path).await.unwrap_err();
+    assert!(err.to_string().contains("'redirect_https' and 'tls' together"));
+  }
+
+  #[tokio::test]
+  async fn test_redirect_https_requires_http_service() {
+    let config_str = r#"
+database:
+  type: clickhouse
+  dsn: "clickhouse://admin:password@127.0.0.1:8123/audit_db"
+
+services:
+  - name: "bad-redirect-tcp"
+    type: "tcp"
+    binds:
+      - addr: "0.0.0.0:2222"
+        redirect_https: true
+    forward_to: "127.0.0.1:22"
+"#;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    write!(file, "{}", config_str).unwrap();
+    let path = file.path().to_path_buf();
+
+    let err = Config::load(&path).await.unwrap_err();
+    assert!(err.to_string().contains("only valid for type 'http'"));
+  }
+
+  #[tokio::test]
+  async fn test_redirect_https_code_must_be_3xx() {
+    let config_str = r#"
+database:
+  type: clickhouse
+  dsn: "clickhouse://admin:password@127.0.0.1:8123/audit_db"
+
+services:
+  - name: "bad-redirect-code"
+    type: "http"
+    binds:
+      - addr: "0.0.0.0:80"
+        redirect_https:
+          enabled: true
+          code: 200
+"#;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    write!(file, "{}", config_str).unwrap();
+    let path = file.path().to_path_buf();
+
+    let err = Config::load(&path).await.unwrap_err();
+    assert!(err.to_string().contains("Expected 3xx status code"));
   }
 
   #[test]

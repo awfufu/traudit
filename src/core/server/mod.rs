@@ -47,6 +47,7 @@ pub async fn run(
       let proxy_proto_config = bind.proxy.clone();
       let mode = bind.mode;
       let real_ip_config = bind.real_ip.clone();
+      let redirect_https = bind.redirect_https.clone();
 
       let is_tcp_service = service.service_type == "tcp";
 
@@ -146,13 +147,15 @@ pub async fn run(
 
       if is_tcp_service {
         // --- TCP Handler (with startup check) ---
-        if let Err(e) = UpstreamStream::connect(&service_config.forward_to).await {
-          tracing::warn!(
-            "[{}] -> '{}': startup check failed: {}",
-            service_config.name,
-            service_config.forward_to,
-            e
-          );
+        if let Some(forward_to) = service_config.forward_to.as_deref() {
+          if let Err(e) = UpstreamStream::connect(forward_to).await {
+            tracing::warn!(
+              "[{}] -> '{}': startup check failed: {}",
+              service_config.name,
+              forward_to,
+              e
+            );
+          }
         }
 
         let db = db.clone();
@@ -198,6 +201,7 @@ pub async fn run(
           listen_addr: bind_addr.clone(),
           real_ip: real_ip_config.clone(),
           add_xff_header: bind.add_xff_header,
+          redirect_https,
         };
         let mut service_obj = http_proxy_service(&conf, inner_proxy);
         let app = unsafe {

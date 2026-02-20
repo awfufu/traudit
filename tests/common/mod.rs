@@ -18,7 +18,8 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 
 use traudit::config::{
-  BindEntry, Config, DatabaseConfig, RealIpConfig, RealIpSource, ServiceConfig, TlsConfig,
+  BindEntry, Config, DatabaseConfig, RealIpConfig, RealIpSource, RedirectHttpsConfig,
+  ServiceConfig, TlsConfig,
 };
 
 static INIT: Once = Once::new();
@@ -354,7 +355,7 @@ pub async fn prepare_env(
     services: vec![ServiceConfig {
       name: "test-svc".to_string(),
       service_type: service_type.to_string(),
-      forward_to: upstream_addr.to_string(),
+      forward_to: Some(upstream_addr.to_string()),
       upstream_proxy: None,
       binds: vec![BindEntry {
         addr: bind_addr.clone(),
@@ -363,6 +364,7 @@ pub async fn prepare_env(
         tls: tls_config,
         real_ip,
         add_xff_header: add_xff,
+        redirect_https: RedirectHttpsConfig::default(),
       }],
     }],
   };

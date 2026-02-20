@@ -126,7 +126,13 @@ pub async fn handle_connection(
   };
 
   // 3. Connect Upstream
-  let mut upstream = UpstreamStream::connect(&service.forward_to).await?;
+  let forward_to = service.forward_to.as_deref().ok_or_else(|| {
+    io::Error::new(
+      io::ErrorKind::InvalidInput,
+      format!("service '{}' missing forward_to", service.name),
+    )
+  })?;
+  let mut upstream = UpstreamStream::connect(forward_to).await?;
 
   // [NEW] Send Proxy Protocol Header if configured
   if let Some(upstream_ver) = &service.upstream_proxy {

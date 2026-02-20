@@ -3,7 +3,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use traudit::config::{
-  BindEntry, Config, DatabaseConfig, RealIpConfig, RealIpSource, ServiceConfig,
+  BindEntry, Config, DatabaseConfig, RealIpConfig, RealIpSource, RedirectHttpsConfig,
+  ServiceConfig,
 };
 
 mod common;
@@ -221,8 +222,9 @@ async fn prepare_chain_env() -> ChainTestResources {
         tls: None,
         add_xff_header: false,
         real_ip: None,
+        redirect_https: RedirectHttpsConfig::default(),
       }],
-      forward_to: addr2.clone(),
+      forward_to: Some(addr2.clone()),
       upstream_proxy: Some("v1".to_string()),
     },
     // E2: (Proxy V1 In, Upstream Proxy V2)
@@ -236,8 +238,9 @@ async fn prepare_chain_env() -> ChainTestResources {
         tls: None,
         add_xff_header: false,
         real_ip: real_ip_pp.clone(),
+        redirect_https: RedirectHttpsConfig::default(),
       }],
-      forward_to: addr3.clone(),
+      forward_to: Some(addr3.clone()),
       upstream_proxy: Some("v2".to_string()),
     },
     // E3: (Proxy V2 In, Upstream Proxy V1)
@@ -251,8 +254,9 @@ async fn prepare_chain_env() -> ChainTestResources {
         tls: None,
         add_xff_header: false,
         real_ip: real_ip_pp.clone(),
+        redirect_https: RedirectHttpsConfig::default(),
       }],
-      forward_to: addr4.clone(),
+      forward_to: Some(addr4.clone()),
       upstream_proxy: Some("v1".to_string()),
     },
     // E4: (Proxy V1 In, No Upstream Proxy -> Mock Server)
@@ -266,8 +270,9 @@ async fn prepare_chain_env() -> ChainTestResources {
         tls: None,
         add_xff_header: false,
         real_ip: real_ip_pp.clone(),
+        redirect_https: RedirectHttpsConfig::default(),
       }],
-      forward_to: e4_upstream_addr.to_string(),
+      forward_to: Some(e4_upstream_addr.to_string()),
       upstream_proxy: None,
     },
   ];

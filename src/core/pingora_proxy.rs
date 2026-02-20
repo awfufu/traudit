@@ -1,7 +1,8 @@
-use crate::config::{RealIpSource, ServiceConfig};
+use crate::config::{RealIpSource, RedirectHttpsConfig, ServiceConfig};
 use crate::db::clickhouse::{ClickHouseLogger, HttpLog, HttpMethod};
 use async_trait::async_trait;
 use pingora::prelude::*;
+use pingora::http::ResponseHeader;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -12,6 +13,7 @@ pub struct TrauditProxy {
   pub listen_addr: String,
   pub real_ip: Option<crate::config::RealIpConfig>,
   pub add_xff_header: bool,
+  pub redirect_https: RedirectHttpsConfig,
 }
 
 pub struct HttpContext {
@@ -237,6 +239,20 @@ impl ProxyHttp for TrauditProxy {
       .unwrap_or("")
       .to_string();
 
+    if self.redirect_https.enabled {
+      let location = build_https_redirect_location(
+        session.req_header(),
+        self.redirect_https.port,
+      )
+      .ok_or_else(|| Error::explain(InternalError, "failed to build https redirect location"))?;
+
+      let mut header = ResponseHeader::build(self.redirect_https.code, Some(0))?;
+      header.insert_header("Location", &location)?;
+      session.set_keepalive(None);
+      session.write_response_header(Box::new(header), true).await?;
+      return Ok(true);
+    }
+
     Ok(false) // false to continue processing
   }
 
@@ -245,7 +261,12 @@ impl ProxyHttp for TrauditProxy {
     _session: &mut Session,
     _ctx: &mut Self::CTX,
   ) -> Result<Box<HttpPeer>> {
-    let addr = &self.service_config.forward_to;
+    let addr = self.service_config.forward_to.as_deref().ok_or_else(|| {
+      Error::explain(
+        InternalError,
+        format!("service '{}' missing forward_to", self.service_config.name),
+      )
+    })?;
     let peer = Box::new(HttpPeer::new(addr, false, "".to_string()));
     Ok(peer)
   }
@@ -305,5 +326,87 @@ impl ProxyHttp for TrauditProxy {
         tracing::error!("failed to insert http log: {}", e);
       }
     });
+  }
+}
+
+fn build_https_redirect_location(req: &pingora::http::RequestHeader, target_port: u16) -> Option<String> {
+  let host_raw = req
+    .uri
+    .host()
+    .map(ToString::to_string)
+    .or_else(|| {
+      req
+        .headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string)
+    })?;
+
+  let authority = host_raw
+    .parse::<http::uri::Authority>()
+    .ok()
+    .map(|a| a.host().to_string())
+    .unwrap_or_else(|| host_raw.clone());
+
+  let needs_brackets = authority.contains(':') && !authority.starts_with('[');
+  let host = if needs_brackets {
+    format!("[{}]", authority)
+  } else {
+    authority
+  };
+
+  let host_port = if target_port == 443 {
+    host
+  } else {
+    format!("{}:{}", host, target_port)
+  };
+
+  let path_q = req
+    .uri
+    .path_and_query()
+    .map(|v| v.as_str())
+    .unwrap_or("/");
+
+  Some(format!("https://{}{}", host_port, path_q))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::build_https_redirect_location;
+  use pingora::http::RequestHeader;
+
+  #[test]
+  fn test_redirect_location_from_host_header_default_port() {
+    let mut req = RequestHeader::build("GET", b"/a/b?x=1", None).unwrap();
+    req.insert_header("Host", "example.com").unwrap();
+
+    let location = build_https_redirect_location(&req, 443).unwrap();
+    assert_eq!(location, "https://example.com/a/b?x=1");
+  }
+
+  #[test]
+  fn test_redirect_location_overrides_host_port() {
+    let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+    req.insert_header("Host", "example.com:8080").unwrap();
+
+    let location = build_https_redirect_location(&req, 8443).unwrap();
+    assert_eq!(location, "https://example.com:8443/");
+  }
+
+  #[test]
+  fn test_redirect_location_ipv6_host() {
+    let mut req = RequestHeader::build("GET", b"/hello", None).unwrap();
+    req.insert_header("Host", "[2001:db8::1]:8080").unwrap();
+
+    let location = build_https_redirect_location(&req, 443).unwrap();
+    assert_eq!(location, "https://[2001:db8::1]/hello");
+  }
+
+  #[test]
+  fn test_redirect_location_missing_host() {
+    let req = RequestHeader::build("GET", b"/", None).unwrap();
+
+    let location = build_https_redirect_location(&req, 443);
+    assert!(location.is_none());
   }
 }
