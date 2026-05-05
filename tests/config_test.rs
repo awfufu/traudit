@@ -146,9 +146,11 @@ services: []
   let path = file.path().to_path_buf();
 
   let config = Config::load(&path).await.unwrap();
+  assert_eq!(config.database.batch_size, 512);
   assert_eq!(config.database.reconnect_backoff_initial_secs, 1);
   assert_eq!(config.database.reconnect_backoff_multiplier, 2.0);
   assert_eq!(config.database.reconnect_backoff_max_secs, 180);
+  assert_eq!(config.database.memory_cache_max_kib, 4096);
 }
 
 #[tokio::test]
@@ -160,6 +162,7 @@ database:
   reconnect_backoff_initial_secs: 3
   reconnect_backoff_multiplier: 1.0
   reconnect_backoff_max_secs: 180
+  memory_cache_max_kib: 2048
 services: []
 "#;
   let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -170,6 +173,7 @@ services: []
   assert_eq!(config.database.reconnect_backoff_initial_secs, 3);
   assert_eq!(config.database.reconnect_backoff_multiplier, 1.0);
   assert_eq!(config.database.reconnect_backoff_max_secs, 180);
+  assert_eq!(config.database.memory_cache_max_kib, 2048);
 }
 
 #[tokio::test]
@@ -181,6 +185,7 @@ database:
   reconnect_backoff_initial_secs: 0
   reconnect_backoff_multiplier: 0.5
   reconnect_backoff_max_secs: 0
+  memory_cache_max_kib: 0
 services: []
 "#;
   let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -191,8 +196,11 @@ services: []
   assert!(res.is_err());
   let err = res.err().unwrap().to_string();
   assert!(
+    err.contains("database.batch_size must be at least 1")
+      ||
     err.contains("database.reconnect_backoff_initial_secs must be at least 1")
       || err.contains("database.reconnect_backoff_multiplier must be at least 1.0")
       || err.contains("database.reconnect_backoff_max_secs must be at least 1")
+      || err.contains("database.memory_cache_max_kib must be at least 1")
   );
 }

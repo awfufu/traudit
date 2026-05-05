@@ -4,9 +4,11 @@ mod migration;
 use serde::{Deserialize, Serialize};
 
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use std::collections::VecDeque;
+use std::mem::size_of;
 use std::net::{IpAddr, Ipv6Addr};
 use std::time::Duration;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize_repr, Deserialize_repr)]
@@ -121,9 +123,41 @@ struct HttpLogRow {
   pub user_agent: String,
 }
 
+#[derive(Debug, Clone)]
+enum PendingLog {
+  Tcp(TcpLog),
+  Http(HttpLog),
+}
+
+impl PendingLog {
+  fn is_same_kind(&self, other: &Self) -> bool {
+    matches!((self, other), (Self::Tcp(_), Self::Tcp(_)) | (Self::Http(_), Self::Http(_)))
+  }
+
+  fn estimated_size(&self) -> usize {
+    match self {
+      Self::Tcp(log) => size_of::<Self>() + log.service.len(),
+      Self::Http(log) => {
+        size_of::<Self>()
+          + log.service.len()
+          + log.host.len()
+          + log.path.len()
+          + log.user_agent.len()
+      }
+    }
+  }
+}
+
+#[derive(Debug, Default)]
+struct PendingQueue {
+  logs: VecDeque<PendingLog>,
+  total_bytes: usize,
+}
+
 pub struct ClickHouseLogger {
   config: DatabaseConfig,
   client: RwLock<Option<Client>>,
+  queue: Mutex<PendingQueue>,
   reconnect_notify: Notify,
 }
 
@@ -134,6 +168,7 @@ impl ClickHouseLogger {
     Ok(Self {
       config: config.clone(),
       client: RwLock::new(None),
+      queue: Mutex::new(PendingQueue::default()),
       reconnect_notify: Notify::new(),
     })
   }
@@ -174,50 +209,194 @@ impl ClickHouseLogger {
     Ok(())
   }
 
+  fn initial_backoff(&self) -> Duration {
+    Duration::from_secs(self.config.reconnect_backoff_initial_secs)
+  }
+
+  fn next_backoff(&self, current: Duration) -> Duration {
+    let max_backoff = Duration::from_secs(self.config.reconnect_backoff_max_secs);
+    let next_backoff_ms =
+      (current.as_secs_f64() * self.config.reconnect_backoff_multiplier * 1000.0).ceil() as u64;
+    std::cmp::min(Duration::from_millis(next_backoff_ms), max_backoff)
+  }
+
+  fn max_cache_bytes(&self) -> usize {
+    self.config.memory_cache_max_kib.saturating_mul(1024)
+  }
+
+  async fn enqueue_log(&self, log: PendingLog) {
+    let mut queue = self.queue.lock().await;
+    let log_size = log.estimated_size();
+    let max_bytes = self.max_cache_bytes();
+
+    while !queue.logs.is_empty() && queue.total_bytes.saturating_add(log_size) > max_bytes {
+      if let Some(oldest) = queue.logs.pop_front() {
+        queue.total_bytes = queue.total_bytes.saturating_sub(oldest.estimated_size());
+      }
+    }
+
+    if log_size > max_bytes {
+      warn!(
+        "dropping oversized audit log entry estimated at {} bytes because cache limit is {} bytes",
+        log_size,
+        max_bytes
+      );
+      return;
+    }
+
+    queue.total_bytes = queue.total_bytes.saturating_add(log_size);
+    queue.logs.push_back(log);
+    drop(queue);
+    self.reconnect_notify.notify_one();
+  }
+
+  async fn has_pending_logs(&self) -> bool {
+    !self.queue.lock().await.logs.is_empty()
+  }
+
+  async fn pop_batch(&self) -> Vec<PendingLog> {
+    let mut queue = self.queue.lock().await;
+    let Some(first) = queue.logs.pop_front() else {
+      return Vec::new();
+    };
+
+    queue.total_bytes = queue.total_bytes.saturating_sub(first.estimated_size());
+
+    let mut batch = Vec::with_capacity(self.config.batch_size);
+    batch.push(first);
+
+    while batch.len() < self.config.batch_size {
+      let Some(next) = queue.logs.front() else {
+        break;
+      };
+
+      if !batch[0].is_same_kind(next) {
+        break;
+      }
+
+      let next = queue.logs.pop_front().expect("front element disappeared");
+      queue.total_bytes = queue.total_bytes.saturating_sub(next.estimated_size());
+      batch.push(next);
+    }
+
+    batch
+  }
+
+  async fn requeue_batch_front(&self, mut logs: Vec<PendingLog>) {
+    if logs.is_empty() {
+      return;
+    }
+
+    let mut queue = self.queue.lock().await;
+    while let Some(log) = logs.pop() {
+      queue.total_bytes = queue.total_bytes.saturating_add(log.estimated_size());
+      queue.logs.push_front(log);
+    }
+  }
+
+  async fn flush_pending_logs(&self) -> anyhow::Result<()> {
+    loop {
+      let batch = self.pop_batch().await;
+      if batch.is_empty() {
+        return Ok(());
+      }
+
+      if let Err(e) = self.write_pending_batch(&batch).await {
+        self.requeue_batch_front(batch).await;
+        return Err(e);
+      }
+    }
+  }
+
+  async fn write_pending_batch(&self, logs: &[PendingLog]) -> anyhow::Result<()> {
+    let Some(client) = self.get_client().await else {
+      anyhow::bail!("database client is not connected");
+    };
+
+    match logs.first() {
+      Some(PendingLog::Tcp(_)) => {
+        let tcp_logs = logs
+          .iter()
+          .map(|log| match log {
+            PendingLog::Tcp(log) => Ok(log),
+            PendingLog::Http(_) => Err(anyhow::anyhow!("mixed log kinds in tcp batch")),
+          })
+          .collect::<anyhow::Result<Vec<_>>>()?;
+        Self::write_tcp_logs(&client, &tcp_logs).await
+      }
+      Some(PendingLog::Http(_)) => {
+        let http_logs = logs
+          .iter()
+          .map(|log| match log {
+            PendingLog::Http(log) => Ok(log),
+            PendingLog::Tcp(_) => Err(anyhow::anyhow!("mixed log kinds in http batch")),
+          })
+          .collect::<anyhow::Result<Vec<_>>>()?;
+        Self::write_http_logs(&client, &http_logs).await
+      }
+      None => Ok(()),
+    }
+  }
+
   pub fn spawn_reconnector(self: std::sync::Arc<Self>) {
     tokio::spawn(async move {
-      let initial_backoff = Duration::from_secs(self.config.reconnect_backoff_initial_secs);
+      let initial_backoff = self.initial_backoff();
       let mut backoff = initial_backoff;
-      let backoff_multiplier = self.config.reconnect_backoff_multiplier;
-      let max_backoff = Duration::from_secs(self.config.reconnect_backoff_max_secs);
       info!("starting database connector in background");
 
       loop {
         let notified = self.reconnect_notify.notified();
 
-        if self.client.read().await.is_some() {
+        if self.client.read().await.is_some() && !self.has_pending_logs().await {
           notified.await;
           continue;
         }
 
-        match Self::build_client(&self.config) {
-          Ok(client) => match Self::init_client(&client).await {
-            Ok(()) => {
-              *self.client.write().await = Some(client);
-              info!("connected to database");
-              backoff = initial_backoff;
-              continue;
-            }
+        if self.client.read().await.is_none() {
+          match Self::build_client(&self.config) {
+            Ok(client) => match Self::init_client(&client).await {
+              Ok(()) => {
+                *self.client.write().await = Some(client);
+                info!("connected to database");
+                backoff = initial_backoff;
+              }
+              Err(e) => {
+                warn!(
+                  "database unavailable, retrying in {}s: {}",
+                  backoff.as_secs(),
+                  e
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = self.next_backoff(backoff);
+                continue;
+              }
+            },
             Err(e) => {
               warn!(
                 "database unavailable, retrying in {}s: {}",
                 backoff.as_secs(),
                 e
               );
+              tokio::time::sleep(backoff).await;
+              backoff = self.next_backoff(backoff);
+              continue;
             }
-          },
-          Err(e) => {
-            warn!(
-              "database unavailable, retrying in {}s: {}",
-              backoff.as_secs(),
-              e
-            );
           }
         }
 
-        tokio::time::sleep(backoff).await;
-        let next_backoff_ms = (backoff.as_secs_f64() * backoff_multiplier * 1000.0).ceil() as u64;
-        backoff = std::cmp::min(Duration::from_millis(next_backoff_ms), max_backoff);
+        if let Err(e) = self.flush_pending_logs().await {
+          self.mark_disconnected().await;
+          warn!(
+            "database unavailable, retrying in {}s: {}",
+            backoff.as_secs(),
+            e
+          );
+          tokio::time::sleep(backoff).await;
+          backoff = self.next_backoff(backoff);
+          continue;
+        }
+
+        backoff = initial_backoff;
       }
     });
   }
@@ -277,94 +456,268 @@ impl ClickHouseLogger {
     migrator.run().await
   }
 
-  pub async fn insert_log(&self, log: TcpLog) -> anyhow::Result<()> {
-    let Some(client) = self.get_client().await else {
-      return Ok(());
-    };
+  async fn write_tcp_logs(client: &Client, logs: &[&TcpLog]) -> anyhow::Result<()> {
+    let mut insert = client.insert::<TcpLogNew>("tcp_log").await?;
 
-    let ipv6 = match log.ip {
-      IpAddr::V4(ip) => ip.to_ipv6_mapped(),
-      IpAddr::V6(ip) => ip,
-    };
+    for log in logs {
+      let ipv6 = match log.ip {
+        IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+        IpAddr::V6(ip) => ip,
+      };
 
-    let row = TcpLogNew {
-      service: log.service,
-      conn_ts: log.conn_ts,
-      duration: log.duration,
-      addr_family: log.addr_family,
-      ip: ipv6,
-      port: log.port,
-      proxy_proto: log.proxy_proto,
-      bytes: log.bytes,
-      bytes_sent: log.bytes_sent,
-      bytes_recv: log.bytes_recv,
-    };
+      let row = TcpLogNew {
+        service: log.service.clone(),
+        conn_ts: log.conn_ts,
+        duration: log.duration,
+        addr_family: log.addr_family,
+        ip: ipv6,
+        port: log.port,
+        proxy_proto: log.proxy_proto,
+        bytes: log.bytes,
+        bytes_sent: log.bytes_sent,
+        bytes_recv: log.bytes_recv,
+      };
 
-    let mut insert = match client.insert::<TcpLogNew>("tcp_log").await {
-      Ok(insert) => insert,
-      Err(e) => {
-        self.mark_disconnected().await;
-        return Err(e.into());
-      }
-    };
-
-    if let Err(e) = insert.write(&row).await {
-      self.mark_disconnected().await;
-      return Err(e.into());
+      insert.write(&row).await?;
     }
 
-    if let Err(e) = insert.end().await {
-      self.mark_disconnected().await;
-      return Err(e.into());
-    }
+    insert.end().await?;
 
     Ok(())
   }
 
-  pub async fn insert_http_log(&self, log: HttpLog) -> anyhow::Result<()> {
-    let Some(client) = self.get_client().await else {
-      return Ok(());
-    };
+  async fn write_http_logs(client: &Client, logs: &[&HttpLog]) -> anyhow::Result<()> {
+    let mut insert = client.insert::<HttpLogRow>("http_log").await?;
 
-    let ipv6 = match log.ip {
-      IpAddr::V4(ip) => ip.to_ipv6_mapped(),
-      IpAddr::V6(ip) => ip,
-    };
+    for log in logs {
+      let ipv6 = match log.ip {
+        IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+        IpAddr::V6(ip) => ip,
+      };
 
-    let row = HttpLogRow {
-      service: log.service,
-      conn_ts: log.conn_ts,
-      duration: log.duration,
-      addr_family: log.addr_family,
-      ip: ipv6,
-      proxy_proto: log.proxy_proto,
-      resp_body_size: log.resp_body_size,
-      req_body_size: log.req_body_size,
-      status_code: log.status_code,
-      method: log.method.as_str().to_string(),
-      host: log.host,
-      path: log.path,
-      user_agent: log.user_agent,
-    };
+      let row = HttpLogRow {
+        service: log.service.clone(),
+        conn_ts: log.conn_ts,
+        duration: log.duration,
+        addr_family: log.addr_family,
+        ip: ipv6,
+        proxy_proto: log.proxy_proto,
+        resp_body_size: log.resp_body_size,
+        req_body_size: log.req_body_size,
+        status_code: log.status_code,
+        method: log.method.as_str().to_string(),
+        host: log.host.clone(),
+        path: log.path.clone(),
+        user_agent: log.user_agent.clone(),
+      };
 
-    let mut insert = match client.insert::<HttpLogRow>("http_log").await {
-      Ok(insert) => insert,
-      Err(e) => {
-        self.mark_disconnected().await;
-        return Err(e.into());
-      }
-    };
-
-    if let Err(e) = insert.write(&row).await {
-      self.mark_disconnected().await;
-      return Err(e.into());
+      insert.write(&row).await?;
     }
 
-    if let Err(e) = insert.end().await {
-      self.mark_disconnected().await;
-      return Err(e.into());
-    }
+    insert.end().await?;
 
     Ok(())
+  }
+
+  pub async fn insert_log(&self, log: TcpLog) -> anyhow::Result<()> {
+    self.enqueue_log(PendingLog::Tcp(log)).await;
+    Ok(())
+  }
+
+  pub async fn insert_http_log(&self, log: HttpLog) -> anyhow::Result<()> {
+    self.enqueue_log(PendingLog::Http(log)).await;
+
+    Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn test_db_config() -> DatabaseConfig {
+    DatabaseConfig {
+      db_type: "clickhouse".to_string(),
+      dsn: "http://127.0.0.1:8123/test".to_string(),
+      batch_size: 1,
+      batch_timeout_secs: 1,
+      reconnect_backoff_initial_secs: 3,
+      reconnect_backoff_multiplier: 2.0,
+      reconnect_backoff_max_secs: 10,
+      memory_cache_max_kib: 4,
+    }
+  }
+
+  #[test]
+  fn test_backoff_progression_respects_multiplier_and_max() {
+    let logger = ClickHouseLogger::new(&test_db_config()).unwrap();
+
+    let first = logger.initial_backoff();
+    let second = logger.next_backoff(first);
+    let third = logger.next_backoff(second);
+
+    assert_eq!(first, Duration::from_secs(3));
+    assert_eq!(second, Duration::from_secs(6));
+    assert_eq!(third, Duration::from_secs(10));
+  }
+
+  #[test]
+  fn test_backoff_can_stay_fixed_after_disconnect() {
+    let mut config = test_db_config();
+    config.reconnect_backoff_multiplier = 1.0;
+    let logger = ClickHouseLogger::new(&config).unwrap();
+
+    let initial = logger.initial_backoff();
+    let after_disconnect_retry = logger.next_backoff(initial);
+
+    assert_eq!(initial, Duration::from_secs(3));
+    assert_eq!(after_disconnect_retry, Duration::from_secs(3));
+  }
+
+  #[tokio::test]
+  async fn test_queue_drops_oldest_when_cache_is_full() {
+    let mut config = test_db_config();
+    config.memory_cache_max_kib = 1;
+    let logger = ClickHouseLogger::new(&config).unwrap();
+
+    let first = PendingLog::Http(HttpLog {
+      service: "svc-1".to_string(),
+      conn_ts: time::OffsetDateTime::now_utc(),
+      duration: 1,
+      addr_family: AddrFamily::Ipv4,
+      ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+      proxy_proto: ProxyProto::None,
+      resp_body_size: 1,
+      req_body_size: 1,
+      status_code: 200,
+      method: HttpMethod::Get,
+      host: "example.com".repeat(10),
+      path: "/first".repeat(20),
+      user_agent: "agent-a".repeat(20),
+    });
+
+    let second = PendingLog::Http(HttpLog {
+      service: "svc-2".to_string(),
+      conn_ts: time::OffsetDateTime::now_utc(),
+      duration: 1,
+      addr_family: AddrFamily::Ipv4,
+      ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+      proxy_proto: ProxyProto::None,
+      resp_body_size: 1,
+      req_body_size: 1,
+      status_code: 200,
+      method: HttpMethod::Get,
+      host: "example.org".repeat(10),
+      path: "/second".repeat(20),
+      user_agent: "agent-b".repeat(20),
+    });
+
+    logger.enqueue_log(first).await;
+    logger.enqueue_log(second).await;
+
+    let queued = logger.pop_next_log().await.unwrap();
+    match queued {
+      PendingLog::Http(log) => assert_eq!(log.service, "svc-2"),
+      PendingLog::Tcp(_) => panic!("expected http log"),
+    }
+    assert!(logger.pop_next_log().await.is_none());
+  }
+
+  #[tokio::test]
+  async fn test_oversized_entry_is_dropped() {
+    let mut config = test_db_config();
+    config.memory_cache_max_kib = 1;
+    let logger = ClickHouseLogger::new(&config).unwrap();
+
+    let oversized = PendingLog::Http(HttpLog {
+      service: "svc".to_string(),
+      conn_ts: time::OffsetDateTime::now_utc(),
+      duration: 1,
+      addr_family: AddrFamily::Ipv4,
+      ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+      proxy_proto: ProxyProto::None,
+      resp_body_size: 1,
+      req_body_size: 1,
+      status_code: 200,
+      method: HttpMethod::Get,
+      host: "h".repeat(600),
+      path: "p".repeat(600),
+      user_agent: "u".repeat(600),
+    });
+
+    logger.enqueue_log(oversized).await;
+
+    assert!(logger.pop_next_log().await.is_none());
+  }
+
+  #[tokio::test]
+  async fn test_pop_batch_keeps_fifo_and_kind_boundaries() {
+    let mut config = test_db_config();
+    config.batch_size = 2;
+    let logger = ClickHouseLogger::new(&config).unwrap();
+
+    logger
+      .enqueue_log(PendingLog::Tcp(TcpLog {
+        service: "tcp-1".to_string(),
+        conn_ts: time::OffsetDateTime::now_utc(),
+        duration: 1,
+        addr_family: AddrFamily::Ipv4,
+        ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port: 22,
+        proxy_proto: ProxyProto::None,
+        bytes: 1,
+        bytes_sent: 1,
+        bytes_recv: 1,
+      }))
+      .await;
+    logger
+      .enqueue_log(PendingLog::Tcp(TcpLog {
+        service: "tcp-2".to_string(),
+        conn_ts: time::OffsetDateTime::now_utc(),
+        duration: 1,
+        addr_family: AddrFamily::Ipv4,
+        ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port: 22,
+        proxy_proto: ProxyProto::None,
+        bytes: 1,
+        bytes_sent: 1,
+        bytes_recv: 1,
+      }))
+      .await;
+    logger
+      .enqueue_log(PendingLog::Http(HttpLog {
+        service: "http-1".to_string(),
+        conn_ts: time::OffsetDateTime::now_utc(),
+        duration: 1,
+        addr_family: AddrFamily::Ipv4,
+        ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        proxy_proto: ProxyProto::None,
+        resp_body_size: 1,
+        req_body_size: 1,
+        status_code: 200,
+        method: HttpMethod::Get,
+        host: "example.com".to_string(),
+        path: "/".to_string(),
+        user_agent: "ua".to_string(),
+      }))
+      .await;
+
+    let first_batch = logger.pop_batch().await;
+    assert_eq!(first_batch.len(), 2);
+    match &first_batch[0] {
+      PendingLog::Tcp(log) => assert_eq!(log.service, "tcp-1"),
+      PendingLog::Http(_) => panic!("expected tcp log"),
+    }
+    match &first_batch[1] {
+      PendingLog::Tcp(log) => assert_eq!(log.service, "tcp-2"),
+      PendingLog::Http(_) => panic!("expected tcp log"),
+    }
+
+    let second_batch = logger.pop_batch().await;
+    assert_eq!(second_batch.len(), 1);
+    match &second_batch[0] {
+      PendingLog::Http(log) => assert_eq!(log.service, "http-1"),
+      PendingLog::Tcp(_) => panic!("expected http log"),
+    }
   }
 }

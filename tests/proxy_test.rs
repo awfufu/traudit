@@ -195,6 +195,7 @@ async fn prepare_chain_env() -> ChainTestResources {
     reconnect_backoff_initial_secs: 1,
     reconnect_backoff_multiplier: 2.0,
     reconnect_backoff_max_secs: 180,
+    memory_cache_max_kib: 4096,
   };
 
   // Create DB

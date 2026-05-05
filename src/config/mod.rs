@@ -28,10 +28,12 @@ pub struct DatabaseConfig {
   pub reconnect_backoff_multiplier: f64,
   #[serde(default = "default_reconnect_backoff_max_secs")]
   pub reconnect_backoff_max_secs: u64,
+  #[serde(default = "default_memory_cache_max_kib")]
+  pub memory_cache_max_kib: usize,
 }
 
 fn default_batch_size() -> usize {
-  1000
+  512
 }
 
 fn default_timeout_secs() -> u64 {
@@ -48,6 +50,10 @@ fn default_reconnect_backoff_multiplier() -> f64 {
 
 fn default_reconnect_backoff_max_secs() -> u64 {
   180
+}
+
+fn default_memory_cache_max_kib() -> usize {
+  4096
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -289,6 +295,14 @@ impl Config {
 
     if self.database.reconnect_backoff_max_secs < 1 {
       anyhow::bail!("database.reconnect_backoff_max_secs must be at least 1");
+    }
+
+    if self.database.memory_cache_max_kib < 1 {
+      anyhow::bail!("database.memory_cache_max_kib must be at least 1");
+    }
+
+    if self.database.batch_size < 1 {
+      anyhow::bail!("database.batch_size must be at least 1");
     }
 
     for service in &self.services {
