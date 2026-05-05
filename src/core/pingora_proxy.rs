@@ -320,12 +320,9 @@ impl ProxyHttp for TrauditProxy {
       user_agent: ctx.user_agent.clone(),
     };
 
-    let db = self.db.clone();
-    tokio::spawn(async move {
-      if let Err(e) = db.insert_http_log(log).await {
-        tracing::error!("failed to insert http log: {}", e);
-      }
-    });
+    if let Err(e) = self.db.insert_http_log(log).await {
+      tracing::error!("failed to insert http log: {}", e);
+    }
   }
 }
 
