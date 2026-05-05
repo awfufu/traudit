@@ -24,17 +24,7 @@ pub async fn run(
     e
   })?;
   let db = Arc::new(db_logger);
-
-  // init db table
-  if let Err(e) = db.init().await {
-    let msg = e.to_string();
-    if msg.len() > 200 {
-      error!("failed to init database: {}... (truncated)", &msg[..200]);
-    } else {
-      error!("failed to init database: {}", msg);
-    }
-    return Err(e);
-  }
+  db.clone().spawn_reconnector();
 
   // JoinSet to manage all server tasks
   let mut join_set = tokio::task::JoinSet::new();

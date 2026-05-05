@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::net::{IpAddr, Ipv6Addr};
-use tracing::info;
+use std::time::Duration;
+use tokio::sync::{Notify, RwLock};
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize_repr, Deserialize_repr)]
 #[repr(i8)]
@@ -120,11 +122,23 @@ struct HttpLogRow {
 }
 
 pub struct ClickHouseLogger {
-  client: Client,
+  config: DatabaseConfig,
+  client: RwLock<Option<Client>>,
+  reconnect_notify: Notify,
 }
 
 impl ClickHouseLogger {
   pub fn new(config: &DatabaseConfig) -> anyhow::Result<Self> {
+    Self::build_client(config)?;
+
+    Ok(Self {
+      config: config.clone(),
+      client: RwLock::new(None),
+      reconnect_notify: Notify::new(),
+    })
+  }
+
+  fn build_client(config: &DatabaseConfig) -> anyhow::Result<Client> {
     let mut url =
       url::Url::parse(&config.dsn).map_err(|e| anyhow::anyhow!("invalid dsn: {}", e))?;
     let db_name = url
@@ -149,19 +163,84 @@ impl ClickHouseLogger {
 
     client = client.with_database(&db_name);
 
-    Ok(Self { client })
+    Ok(client)
+  }
+
+  async fn init_client(client: &Client) -> anyhow::Result<()> {
+    // Check migrations
+    Self::check_migrations(client).await?;
+    Self::ensure_http_table(client).await?;
+
+    Ok(())
+  }
+
+  pub fn spawn_reconnector(self: std::sync::Arc<Self>) {
+    tokio::spawn(async move {
+      let mut backoff = Duration::from_secs(1);
+      info!("starting database connector in background");
+
+      loop {
+        let notified = self.reconnect_notify.notified();
+
+        if self.client.read().await.is_some() {
+          notified.await;
+          continue;
+        }
+
+        match Self::build_client(&self.config) {
+          Ok(client) => match Self::init_client(&client).await {
+            Ok(()) => {
+              *self.client.write().await = Some(client);
+              info!("connected to database");
+              backoff = Duration::from_secs(1);
+              continue;
+            }
+            Err(e) => {
+              warn!(
+                "database unavailable, retrying in {}s: {}",
+                backoff.as_secs(),
+                e
+              );
+            }
+          },
+          Err(e) => {
+            warn!(
+              "database unavailable, retrying in {}s: {}",
+              backoff.as_secs(),
+              e
+            );
+          }
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(180));
+      }
+    });
+  }
+
+  async fn get_client(&self) -> Option<Client> {
+    self.client.read().await.clone()
+  }
+
+  async fn mark_disconnected(&self) {
+    let mut guard = self.client.write().await;
+    if guard.take().is_some() {
+      warn!("database connection lost, switching to background reconnect");
+    }
+    drop(guard);
+    self.reconnect_notify.notify_one();
   }
 
   pub async fn init(&self) -> anyhow::Result<()> {
-    // Check migrations
-    self.check_migrations().await?;
-    self.ensure_http_table().await?;
+    let client = Self::build_client(&self.config)?;
+    Self::init_client(&client).await?;
+    *self.client.write().await = Some(client);
 
     info!("connected to database");
     Ok(())
   }
 
-  async fn ensure_http_table(&self) -> anyhow::Result<()> {
+  async fn ensure_http_table(client: &Client) -> anyhow::Result<()> {
     let sql_create = r#"
     CREATE TABLE IF NOT EXISTS http_log (
         service     LowCardinality(String) CODEC(ZSTD(1)),
@@ -181,8 +260,7 @@ impl ClickHouseLogger {
     PARTITION BY toYYYYMM(conn_ts)
     ORDER BY (conn_ts, service, host);
     "#;
-    self
-      .client
+    client
       .query(sql_create)
       .execute()
       .await
@@ -190,12 +268,16 @@ impl ClickHouseLogger {
     Ok(())
   }
 
-  async fn check_migrations(&self) -> anyhow::Result<()> {
-    let migrator = migration::Migrator::new(self.client.clone());
+  async fn check_migrations(client: &Client) -> anyhow::Result<()> {
+    let migrator = migration::Migrator::new(client.clone());
     migrator.run().await
   }
 
   pub async fn insert_log(&self, log: TcpLog) -> anyhow::Result<()> {
+    let Some(client) = self.get_client().await else {
+      return Ok(());
+    };
+
     let ipv6 = match log.ip {
       IpAddr::V4(ip) => ip.to_ipv6_mapped(),
       IpAddr::V6(ip) => ip,
@@ -214,14 +296,32 @@ impl ClickHouseLogger {
       bytes_recv: log.bytes_recv,
     };
 
-    let mut insert = self.client.insert::<TcpLogNew>("tcp_log").await?;
-    insert.write(&row).await?;
-    insert.end().await?;
+    let mut insert = match client.insert::<TcpLogNew>("tcp_log").await {
+      Ok(insert) => insert,
+      Err(e) => {
+        self.mark_disconnected().await;
+        return Err(e.into());
+      }
+    };
+
+    if let Err(e) = insert.write(&row).await {
+      self.mark_disconnected().await;
+      return Err(e.into());
+    }
+
+    if let Err(e) = insert.end().await {
+      self.mark_disconnected().await;
+      return Err(e.into());
+    }
 
     Ok(())
   }
 
   pub async fn insert_http_log(&self, log: HttpLog) -> anyhow::Result<()> {
+    let Some(client) = self.get_client().await else {
+      return Ok(());
+    };
+
     let ipv6 = match log.ip {
       IpAddr::V4(ip) => ip.to_ipv6_mapped(),
       IpAddr::V6(ip) => ip,
@@ -243,9 +343,23 @@ impl ClickHouseLogger {
       user_agent: log.user_agent,
     };
 
-    let mut insert = self.client.insert::<HttpLogRow>("http_log").await?;
-    insert.write(&row).await?;
-    insert.end().await?;
+    let mut insert = match client.insert::<HttpLogRow>("http_log").await {
+      Ok(insert) => insert,
+      Err(e) => {
+        self.mark_disconnected().await;
+        return Err(e.into());
+      }
+    };
+
+    if let Err(e) = insert.write(&row).await {
+      self.mark_disconnected().await;
+      return Err(e.into());
+    }
+
+    if let Err(e) = insert.end().await {
+      self.mark_disconnected().await;
+      return Err(e.into());
+    }
 
     Ok(())
   }
