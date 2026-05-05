@@ -100,7 +100,7 @@ impl Drop for ManagedClickHouse {
 struct RunningServer {
   proxy_addr: String,
   startup_probe_logs: u64,
-  shutdown_tx: tokio::sync::broadcast::Sender<()>,
+  shutdown_tx: tokio::sync::broadcast::Sender<traudit::core::server::ShutdownReason>,
   handle: JoinHandle<()>,
 }
 
@@ -189,7 +189,9 @@ impl RunningServer {
   }
 
   async fn shutdown(self) {
-    let _ = self.shutdown_tx.send(());
+    let _ = self
+      .shutdown_tx
+      .send(traudit::core::server::ShutdownReason::Terminate);
     tokio::time::sleep(Duration::from_secs(1)).await;
     self.handle.abort();
   }

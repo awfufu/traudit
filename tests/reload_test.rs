@@ -144,12 +144,9 @@ services:
     .status()
     .await?;
 
-  // Start Traudit using cargo run to ensure correct binary execution
-  let mut _child = Command::new("cargo")
-    .arg("run")
-    .arg("--bin")
-    .arg("traudit")
-    .arg("--")
+  // Start Traudit using the built binary directly to avoid an extra cargo wrapper process.
+  let traudit_bin = std::env::current_dir()?.join("target/debug/traudit");
+  let mut _child = Command::new(&traudit_bin)
     .arg("-f")
     .arg(&config_path)
     .stdout(std::process::Stdio::null())

@@ -309,7 +309,7 @@ pub async fn serve_listener_loop<F, Fut>(
   real_ip_config: Option<crate::config::RealIpConfig>,
   proxy_cfg: Option<String>,
   tls_acceptor: Option<Arc<SslAcceptor>>,
-  mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+  mut shutdown_rx: tokio::sync::broadcast::Receiver<crate::core::server::ShutdownReason>,
   handler: F,
 ) where
   F: Fn(UnifiedPingoraStream, Option<crate::protocol::ProxyInfo>, std::net::SocketAddr) -> Fut

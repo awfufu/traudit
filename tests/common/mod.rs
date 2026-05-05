@@ -416,7 +416,8 @@ pub async fn run_tcp_test(test_name: &str, proxy_proto: Option<&str>, is_unix: b
   .await;
 
   tokio::spawn(async move {
-    let (tx, _rx) = tokio::sync::broadcast::channel(1);
+    let (tx, _rx) =
+      tokio::sync::broadcast::channel::<traudit::core::server::ShutdownReason>(1);
     let _ = traudit::core::server::run(res.config, tx).await;
   });
   // Wait for traudit startup and DB connect
@@ -497,7 +498,8 @@ pub async fn run_http_test(
   .await;
 
   tokio::spawn(async move {
-    let (tx, _rx) = tokio::sync::broadcast::channel(1);
+    let (tx, _rx) =
+      tokio::sync::broadcast::channel::<traudit::core::server::ShutdownReason>(1);
     let _ = traudit::core::server::run(res.config, tx).await;
   });
   tokio::time::sleep(Duration::from_millis(1000)).await;

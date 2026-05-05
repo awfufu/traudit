@@ -5,6 +5,12 @@ use pingora::apps::ServerApp;
 use std::sync::Arc;
 use tracing::{error, info};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownReason {
+  Reload,
+  Terminate,
+}
+
 pub mod context;
 pub mod handler;
 pub mod listener;
@@ -17,7 +23,7 @@ use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 
 pub async fn run(
   config: Config,
-  shutdown_tx: tokio::sync::broadcast::Sender<()>,
+  shutdown_tx: tokio::sync::broadcast::Sender<ShutdownReason>,
 ) -> anyhow::Result<()> {
   let db_logger = ClickHouseLogger::new(&config.database).map_err(|e| {
     error!("database: {}", e);
@@ -25,6 +31,8 @@ pub async fn run(
   })?;
   let db = Arc::new(db_logger);
   db.clone().spawn_reconnector();
+  db.import_reload_buffer().await;
+  let mut shutdown_reason_rx = shutdown_tx.subscribe();
 
   // JoinSet to manage all server tasks
   let mut join_set = tokio::task::JoinSet::new();
@@ -254,7 +262,8 @@ pub async fn run(
     }
   }
 
-  db.shutdown().await;
+  let shutdown_reason = shutdown_reason_rx.try_recv().unwrap_or(ShutdownReason::Terminate);
+  db.shutdown(shutdown_reason).await;
 
   info!("server components finished.");
   Ok(())

@@ -1,12 +1,16 @@
 use crate::config::DatabaseConfig;
+use crate::core::server::ShutdownReason;
 use clickhouse::{Client, Row};
 mod migration;
 use serde::{Deserialize, Serialize};
 
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::net::{IpAddr, Ipv6Addr};
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{info, warn};
@@ -27,7 +31,7 @@ pub enum AddrFamily {
   Ipv6 = 10,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcpLog {
   pub service: String,
   pub conn_ts: time::OffsetDateTime,
@@ -88,7 +92,7 @@ impl HttpMethod {
   }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpLog {
   pub service: String,
   pub conn_ts: time::OffsetDateTime,
@@ -123,7 +127,7 @@ struct HttpLogRow {
   pub user_agent: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum PendingLog {
   Tcp(TcpLog),
   Http(HttpLog),
@@ -222,6 +226,83 @@ impl ClickHouseLogger {
 
   fn max_cache_bytes(&self) -> usize {
     self.config.memory_cache_max_kib.saturating_mul(1024)
+  }
+
+  fn reload_buffer_path(&self) -> PathBuf {
+    let mut url =
+      url::Url::parse(&self.config.dsn).unwrap_or_else(|_| url::Url::parse("http://invalid/traudit").unwrap());
+    let db_name = url
+      .path_segments()
+      .and_then(|mut segments| segments.next())
+      .filter(|db| !db.is_empty())
+      .unwrap_or("traudit")
+      .to_string();
+    url.set_password(None).ok();
+    let mut hasher = DefaultHasher::new();
+    format!("{}:{}", db_name, url.as_str()).hash(&mut hasher);
+    PathBuf::from(format!(
+      "/tmp/traudit-reload-buffer-{:x}.json",
+      hasher.finish()
+    ))
+  }
+
+  pub async fn import_reload_buffer(&self) {
+    let path = self.reload_buffer_path();
+    let content = match tokio::fs::read_to_string(&path).await {
+      Ok(content) => content,
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+      Err(e) => {
+        warn!("failed to read reload buffer {}: {}", path.display(), e);
+        return;
+      }
+    };
+
+    let logs: Vec<PendingLog> = match serde_json::from_str(&content) {
+      Ok(logs) => logs,
+      Err(e) => {
+        warn!("failed to parse reload buffer {}: {}", path.display(), e);
+        let _ = tokio::fs::remove_file(&path).await;
+        return;
+      }
+    };
+
+    let mut queue = self.queue.lock().await;
+    for log in logs {
+      queue.total_bytes = queue.total_bytes.saturating_add(log.estimated_size());
+      queue.logs.push_back(log);
+    }
+    drop(queue);
+
+    if let Err(e) = tokio::fs::remove_file(&path).await {
+      warn!("failed to remove reload buffer {}: {}", path.display(), e);
+    }
+
+    self.reconnect_notify.notify_one();
+  }
+
+  async fn export_reload_buffer(&self) {
+    let path = self.reload_buffer_path();
+    let queue = self.queue.lock().await;
+    if queue.logs.is_empty() {
+      drop(queue);
+      let _ = tokio::fs::remove_file(&path).await;
+      return;
+    }
+
+    let logs: Vec<PendingLog> = queue.logs.iter().cloned().collect();
+    drop(queue);
+
+    let serialized = match serde_json::to_string(&logs) {
+      Ok(serialized) => serialized,
+      Err(e) => {
+        warn!("failed to serialize reload buffer {}: {}", path.display(), e);
+        return;
+      }
+    };
+
+    if let Err(e) = tokio::fs::write(&path, serialized).await {
+      warn!("failed to write reload buffer {}: {}", path.display(), e);
+    }
   }
 
   async fn enqueue_log(&self, log: PendingLog) {
@@ -338,7 +419,7 @@ impl ClickHouseLogger {
     }
   }
 
-  pub async fn shutdown(&self) {
+  pub async fn shutdown(&self, reason: ShutdownReason) {
     self.reconnect_notify.notify_waiters();
 
     if self.client.read().await.is_none() {
@@ -362,6 +443,10 @@ impl ClickHouseLogger {
 
     if let Err(e) = self.flush_pending_logs().await {
       warn!("failed to flush pending audit logs during shutdown: {}", e);
+    }
+
+    if reason == ShutdownReason::Reload && self.has_pending_logs().await {
+      self.export_reload_buffer().await;
     }
   }
 

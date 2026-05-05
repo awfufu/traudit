@@ -108,7 +108,8 @@ async fn main() -> anyhow::Result<()> {
   }
 
   // Create a channel to signal shutdown to the server component
-  let (shutdown_tx, _shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+  let (shutdown_tx, _shutdown_rx) =
+    tokio::sync::broadcast::channel::<traudit::core::server::ShutdownReason>(1);
   let shutdown_tx_clone = shutdown_tx.clone();
 
   // Run server in a separate task
@@ -179,18 +180,18 @@ async fn main() -> anyhow::Result<()> {
       }
       // Initiate graceful shutdown for this process
       info!("shutting down old process gracefully (draining connections)...");
-      let _ = shutdown_tx.send(());
+      let _ = shutdown_tx.send(traudit::core::server::ShutdownReason::Reload);
       // Wait for server to finish (graceful drain)
       let _ = server_handle.await;
     }
     _ = sigint.recv() => {
       info!("received SIGINT, shutting down gracefully...");
-      let _ = shutdown_tx.send(());
+      let _ = shutdown_tx.send(traudit::core::server::ShutdownReason::Terminate);
       let _ = server_handle.await;
     }
     _ = sigterm.recv() => {
       info!("received SIGTERM, shutting down gracefully...");
-      let _ = shutdown_tx.send(());
+      let _ = shutdown_tx.send(traudit::core::server::ShutdownReason::Terminate);
       let _ = server_handle.await;
     }
   }
