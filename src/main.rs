@@ -184,10 +184,14 @@ async fn main() -> anyhow::Result<()> {
       let _ = server_handle.await;
     }
     _ = sigint.recv() => {
-      info!("received SIGINT, exiting immediately...");
+      info!("received SIGINT, shutting down gracefully...");
+      let _ = shutdown_tx.send(());
+      let _ = server_handle.await;
     }
     _ = sigterm.recv() => {
-      info!("received SIGTERM, exiting immediately...");
+      info!("received SIGTERM, shutting down gracefully...");
+      let _ = shutdown_tx.send(());
+      let _ = server_handle.await;
     }
   }
 

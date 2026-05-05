@@ -338,6 +338,33 @@ impl ClickHouseLogger {
     }
   }
 
+  pub async fn shutdown(&self) {
+    self.reconnect_notify.notify_waiters();
+
+    if self.client.read().await.is_none() {
+      match Self::build_client(&self.config) {
+        Ok(client) => match Self::init_client(&client).await {
+          Ok(()) => {
+            *self.client.write().await = Some(client);
+            info!("connected to database during shutdown drain");
+          }
+          Err(e) => {
+            warn!("failed to connect database during shutdown drain: {}", e);
+            return;
+          }
+        },
+        Err(e) => {
+          warn!("failed to build database client during shutdown drain: {}", e);
+          return;
+        }
+      }
+    }
+
+    if let Err(e) = self.flush_pending_logs().await {
+      warn!("failed to flush pending audit logs during shutdown: {}", e);
+    }
+  }
+
   pub fn spawn_reconnector(self: std::sync::Arc<Self>) {
     tokio::spawn(async move {
       let initial_backoff = self.initial_backoff();

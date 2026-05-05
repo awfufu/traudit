@@ -254,6 +254,8 @@ pub async fn run(
     }
   }
 
+  db.shutdown().await;
+
   info!("server components finished.");
   Ok(())
 }
