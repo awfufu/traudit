@@ -146,7 +146,29 @@ services: []
   let path = file.path().to_path_buf();
 
   let config = Config::load(&path).await.unwrap();
-  assert_eq!(config.database.reconnect_backoff_multiplier, 2);
+  assert_eq!(config.database.reconnect_backoff_initial_secs, 1);
+  assert_eq!(config.database.reconnect_backoff_multiplier, 2.0);
+  assert_eq!(config.database.reconnect_backoff_max_secs, 180);
+}
+
+#[tokio::test]
+async fn test_database_fixed_backoff_settings() {
+  let config_str = r#"
+database:
+  type: clickhouse
+  dsn: "http://127.0.0.1:8123/fixed"
+  reconnect_backoff_initial_secs: 3
+  reconnect_backoff_multiplier: 1.0
+  reconnect_backoff_max_secs: 180
+services: []
+"#;
+  let mut file = tempfile::NamedTempFile::new().unwrap();
+  write!(file, "{}", config_str).unwrap();
+  let path = file.path().to_path_buf();
+
+  let config = Config::load(&path).await.unwrap();
+  assert_eq!(config.database.reconnect_backoff_initial_secs, 3);
+  assert_eq!(config.database.reconnect_backoff_multiplier, 1.0);
   assert_eq!(config.database.reconnect_backoff_max_secs, 180);
 }
 
@@ -156,7 +178,8 @@ async fn test_error_invalid_database_backoff_settings() {
 database:
   type: clickhouse
   dsn: "http://127.0.0.1:8123/invalid"
-  reconnect_backoff_multiplier: 0
+  reconnect_backoff_initial_secs: 0
+  reconnect_backoff_multiplier: 0.5
   reconnect_backoff_max_secs: 0
 services: []
 "#;
@@ -167,5 +190,9 @@ services: []
   let res = Config::load(&path).await;
   assert!(res.is_err());
   let err = res.err().unwrap().to_string();
-  assert!(err.contains("database.reconnect_backoff_multiplier must be at least 1"));
+  assert!(
+    err.contains("database.reconnect_backoff_initial_secs must be at least 1")
+      || err.contains("database.reconnect_backoff_multiplier must be at least 1.0")
+      || err.contains("database.reconnect_backoff_max_secs must be at least 1")
+  );
 }

@@ -6,7 +6,8 @@ database:
   dsn: http://traudit:traudit114514@127.0.0.1:8123/traudit
   batch_size: 50
   batch_timeout_secs: 100
-  reconnect_backoff_multiplier: 2
+  reconnect_backoff_initial_secs: 1
+  reconnect_backoff_multiplier: 2.0
   reconnect_backoff_max_secs: 180
 
 services:

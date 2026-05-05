@@ -22,8 +22,10 @@ pub struct DatabaseConfig {
   #[serde(default = "default_timeout_secs")]
   #[allow(dead_code)]
   pub batch_timeout_secs: u64,
+  #[serde(default = "default_reconnect_backoff_initial_secs")]
+  pub reconnect_backoff_initial_secs: u64,
   #[serde(default = "default_reconnect_backoff_multiplier")]
-  pub reconnect_backoff_multiplier: u32,
+  pub reconnect_backoff_multiplier: f64,
   #[serde(default = "default_reconnect_backoff_max_secs")]
   pub reconnect_backoff_max_secs: u64,
 }
@@ -36,8 +38,12 @@ fn default_timeout_secs() -> u64 {
   5
 }
 
-fn default_reconnect_backoff_multiplier() -> u32 {
-  2
+fn default_reconnect_backoff_initial_secs() -> u64 {
+  1
+}
+
+fn default_reconnect_backoff_multiplier() -> f64 {
+  2.0
 }
 
 fn default_reconnect_backoff_max_secs() -> u64 {
@@ -268,8 +274,17 @@ impl Config {
 
   pub fn validate(&self) -> anyhow::Result<()> {
     let mut seen_service_names = HashSet::new();
-    if self.database.reconnect_backoff_multiplier < 1 {
-      anyhow::bail!("database.reconnect_backoff_multiplier must be at least 1");
+
+    if self.database.reconnect_backoff_initial_secs < 1 {
+      anyhow::bail!("database.reconnect_backoff_initial_secs must be at least 1");
+    }
+
+    if !self.database.reconnect_backoff_multiplier.is_finite() {
+      anyhow::bail!("database.reconnect_backoff_multiplier must be a finite number");
+    }
+
+    if self.database.reconnect_backoff_multiplier < 1.0 {
+      anyhow::bail!("database.reconnect_backoff_multiplier must be at least 1.0");
     }
 
     if self.database.reconnect_backoff_max_secs < 1 {
