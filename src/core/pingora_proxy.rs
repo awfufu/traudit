@@ -148,11 +148,8 @@ impl ProxyHttp for TrauditProxy {
     let (physical_addr, proxy_info) = crate::core::server::context::CONNECTION_META
       .try_with(|meta| (meta.physical_addr, meta.proxy_info.clone()))
       .unwrap_or((std::net::SocketAddr::new(peer_addr, 0), None));
-    let physical_fmt = if self.listen_addr.starts_with("unix://") {
-      "local".to_string()
-    } else {
-      physical_addr.to_string()
-    };
+    let is_unix_listener = self.listen_addr.starts_with("unix://");
+    let physical_fmt = physical_addr.to_string();
 
     let host = session
       .req_header()
@@ -178,6 +175,14 @@ impl ProxyHttp for TrauditProxy {
       .as_ref()
       .map_or(false, |cfg| !cfg.is_trusted(physical_addr.ip()));
 
+    let real_ip_detail = match self.real_ip.as_ref().map(|cfg| &cfg.source) {
+      Some(RealIpSource::Xff) if resolved_ip != peer_addr => Some(format!("xff: {}", resolved_ip)),
+      Some(RealIpSource::ProxyProtocol) => proxy_info
+        .as_ref()
+        .map(crate::core::logging::format_proxy_protocol_detail),
+      _ => None,
+    };
+
     if let Some(xff) = session.req_header().headers.get("x-forwarded-for") {
       if let Ok(v) = xff.to_str() {
         if resolved_ip != peer_addr {
@@ -197,8 +202,8 @@ impl ProxyHttp for TrauditProxy {
       crate::core::logging::format_connection_log(
         &self.service_config.name,
         &self.listen_addr,
-        &physical_fmt,
-        proxy_info.as_ref(),
+        (!is_unix_listener).then_some(physical_fmt.as_str()),
+        real_ip_detail.as_deref(),
         is_untrusted,
         Some(&host),
       )

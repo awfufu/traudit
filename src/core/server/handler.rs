@@ -69,11 +69,7 @@ pub async fn handle_connection(
     false
   };
 
-  let src_fmt = if is_unix {
-    "local".to_string()
-  } else {
-    physical_addr.to_string()
-  };
+  let src_fmt = physical_addr.to_string();
 
   let mut is_untrusted = false;
 
@@ -84,11 +80,18 @@ pub async fn handle_connection(
     }
   }
 
+  let real_ip_detail = match real_ip_config.as_ref().map(|cfg| &cfg.source) {
+    Some(RealIpSource::ProxyProtocol) => proxy_info
+      .as_ref()
+      .map(crate::core::logging::format_proxy_protocol_detail),
+    _ => None,
+  };
+
   let log_msg = crate::core::logging::format_connection_log(
     &service.name,
     &listen_addr,
-    &src_fmt,
-    proxy_info.as_ref(),
+    (!is_unix).then_some(src_fmt.as_str()),
+    real_ip_detail.as_deref(),
     is_untrusted,
     None,
   );
