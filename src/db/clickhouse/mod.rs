@@ -615,12 +615,13 @@ mod tests {
     logger.enqueue_log(first).await;
     logger.enqueue_log(second).await;
 
-    let queued = logger.pop_next_log().await.unwrap();
-    match queued {
+    let queued = logger.pop_batch().await;
+    assert_eq!(queued.len(), 1);
+    match queued.into_iter().next().unwrap() {
       PendingLog::Http(log) => assert_eq!(log.service, "svc-2"),
       PendingLog::Tcp(_) => panic!("expected http log"),
     }
-    assert!(logger.pop_next_log().await.is_none());
+    assert!(logger.pop_batch().await.is_empty());
   }
 
   #[tokio::test]
@@ -647,7 +648,7 @@ mod tests {
 
     logger.enqueue_log(oversized).await;
 
-    assert!(logger.pop_next_log().await.is_none());
+    assert!(logger.pop_batch().await.is_empty());
   }
 
   #[tokio::test]
