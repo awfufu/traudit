@@ -6,6 +6,8 @@ database:
   dsn: http://traudit:traudit114514@127.0.0.1:8123/traudit
   batch_size: 50
   batch_timeout_secs: 100
+  reconnect_backoff_multiplier: 2
+  reconnect_backoff_max_secs: 180
 
 services:
   # Receives traffic from FRP with v2 Proxy Protocol header, audits it,
@@ -41,4 +43,3 @@ services:
           trust_private_ranges: true
           trusted_proxies:
             - 1.2.3.4
-

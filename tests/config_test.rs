@@ -132,3 +132,40 @@ services:
   let err = res.err().unwrap().to_string();
   assert!(err.contains("duplicate the IP"));
 }
+
+#[tokio::test]
+async fn test_database_backoff_defaults() {
+  let config_str = r#"
+database:
+  type: clickhouse
+  dsn: "http://127.0.0.1:8123/defaults"
+services: []
+"#;
+  let mut file = tempfile::NamedTempFile::new().unwrap();
+  write!(file, "{}", config_str).unwrap();
+  let path = file.path().to_path_buf();
+
+  let config = Config::load(&path).await.unwrap();
+  assert_eq!(config.database.reconnect_backoff_multiplier, 2);
+  assert_eq!(config.database.reconnect_backoff_max_secs, 180);
+}
+
+#[tokio::test]
+async fn test_error_invalid_database_backoff_settings() {
+  let config_str = r#"
+database:
+  type: clickhouse
+  dsn: "http://127.0.0.1:8123/invalid"
+  reconnect_backoff_multiplier: 0
+  reconnect_backoff_max_secs: 0
+services: []
+"#;
+  let mut file = tempfile::NamedTempFile::new().unwrap();
+  write!(file, "{}", config_str).unwrap();
+  let path = file.path().to_path_buf();
+
+  let res = Config::load(&path).await;
+  assert!(res.is_err());
+  let err = res.err().unwrap().to_string();
+  assert!(err.contains("database.reconnect_backoff_multiplier must be at least 1"));
+}

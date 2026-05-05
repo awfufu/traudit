@@ -192,6 +192,8 @@ async fn prepare_chain_env() -> ChainTestResources {
     dsn: format!("http://traudit:traudit@127.0.0.1:{}/chain_test", db_port),
     batch_size: 1,
     batch_timeout_secs: 1,
+    reconnect_backoff_multiplier: 2,
+    reconnect_backoff_max_secs: 180,
   };
 
   // Create DB

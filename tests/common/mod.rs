@@ -351,6 +351,8 @@ pub async fn prepare_env(
       dsn: format!("http://traudit:traudit@127.0.0.1:{}/{}", db_port, db_name),
       batch_size: 1,
       batch_timeout_secs: 1,
+      reconnect_backoff_multiplier: 2,
+      reconnect_backoff_max_secs: 180,
     },
     services: vec![ServiceConfig {
       name: "test-svc".to_string(),

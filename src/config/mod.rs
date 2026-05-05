@@ -22,6 +22,10 @@ pub struct DatabaseConfig {
   #[serde(default = "default_timeout_secs")]
   #[allow(dead_code)]
   pub batch_timeout_secs: u64,
+  #[serde(default = "default_reconnect_backoff_multiplier")]
+  pub reconnect_backoff_multiplier: u32,
+  #[serde(default = "default_reconnect_backoff_max_secs")]
+  pub reconnect_backoff_max_secs: u64,
 }
 
 fn default_batch_size() -> usize {
@@ -30,6 +34,14 @@ fn default_batch_size() -> usize {
 
 fn default_timeout_secs() -> u64 {
   5
+}
+
+fn default_reconnect_backoff_multiplier() -> u32 {
+  2
+}
+
+fn default_reconnect_backoff_max_secs() -> u64 {
+  180
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -256,6 +268,14 @@ impl Config {
 
   pub fn validate(&self) -> anyhow::Result<()> {
     let mut seen_service_names = HashSet::new();
+    if self.database.reconnect_backoff_multiplier < 1 {
+      anyhow::bail!("database.reconnect_backoff_multiplier must be at least 1");
+    }
+
+    if self.database.reconnect_backoff_max_secs < 1 {
+      anyhow::bail!("database.reconnect_backoff_max_secs must be at least 1");
+    }
+
     for service in &self.services {
       if !seen_service_names.insert(service.name.as_str()) {
         anyhow::bail!(

@@ -177,6 +177,8 @@ impl ClickHouseLogger {
   pub fn spawn_reconnector(self: std::sync::Arc<Self>) {
     tokio::spawn(async move {
       let mut backoff = Duration::from_secs(1);
+      let backoff_multiplier = self.config.reconnect_backoff_multiplier;
+      let max_backoff = Duration::from_secs(self.config.reconnect_backoff_max_secs);
       info!("starting database connector in background");
 
       loop {
@@ -213,7 +215,7 @@ impl ClickHouseLogger {
         }
 
         tokio::time::sleep(backoff).await;
-        backoff = std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(180));
+        backoff = std::cmp::min(backoff.saturating_mul(backoff_multiplier), max_backoff);
       }
     });
   }
