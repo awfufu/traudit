@@ -75,7 +75,6 @@ pub async fn handle_connection(
     physical_addr.to_string()
   };
 
-  let mut extras = Vec::new();
   let mut is_untrusted = false;
 
   // Determine untrusted status based solely on RealIpConfig trust range
@@ -85,33 +84,14 @@ pub async fn handle_connection(
     }
   }
 
-  // If we have proxy info, we should show it.
-  if let Some(ref info) = proxy_info {
-    // Only show (untrusted) if we have proxy info and the source is not trusted
-    if is_untrusted {
-      extras.push("(untrusted)".to_string());
-    }
-
-    let version_str = match info.version {
-      protocol::Version::V1 => "proxy.v1",
-      protocol::Version::V2 => "proxy.v2",
-    };
-    let helper_str = format!("{}: {}", version_str, info.source);
-    extras.push(format!("({})", helper_str));
-  } else if is_untrusted && real_ip_config.is_some() {
-  }
-
-  let log_msg = if extras.is_empty() {
-    format!("[{}] {} <- {}", service.name, listen_addr, src_fmt)
-  } else {
-    format!(
-      "[{}] {} <- {} {}",
-      service.name,
-      listen_addr,
-      src_fmt,
-      extras.join(" ")
-    )
-  };
+  let log_msg = crate::core::logging::format_connection_log(
+    &service.name,
+    &listen_addr,
+    &src_fmt,
+    proxy_info.as_ref(),
+    is_untrusted,
+    None,
+  );
 
   info!("{}", log_msg);
 

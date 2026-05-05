@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
 
   tracing_subscriber::fmt()
     .with_env_filter(env_filter)
+    .without_time()
     .with_target(false)
     .with_thread_ids(false)
     .with_file(false)

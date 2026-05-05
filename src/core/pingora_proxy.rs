@@ -148,62 +148,61 @@ impl ProxyHttp for TrauditProxy {
     let (physical_addr, proxy_info) = crate::core::server::context::CONNECTION_META
       .try_with(|meta| (meta.physical_addr, meta.proxy_info.clone()))
       .unwrap_or((std::net::SocketAddr::new(peer_addr, 0), None));
-    let physical_fmt = physical_addr.to_string();
+    let physical_fmt = if self.listen_addr.starts_with("unix://") {
+      "local".to_string()
+    } else {
+      physical_addr.to_string()
+    };
 
-    let mut extras = Vec::new();
+    let host = session
+      .req_header()
+      .uri
+      .authority()
+      .map(|authority| authority.host().to_string())
+      .or_else(|| {
+        session
+          .req_header()
+          .headers
+          .get("host")
+          .and_then(|h| h.to_str().ok())
+          .map(|h| {
+            h.parse::<http::uri::Authority>()
+              .map(|authority| authority.host().to_string())
+              .unwrap_or_else(|_| h.to_string())
+          })
+      })
+      .unwrap_or_default();
+
     let is_untrusted = self
       .real_ip
       .as_ref()
       .map_or(false, |cfg| !cfg.is_trusted(physical_addr.ip()));
 
-    if let Some(info) = proxy_info {
-      let v = match info.version {
-        crate::protocol::Version::V1 => "proxy.v1",
-        _ => "proxy.v2",
-      };
-      extras.push(format!("{}: {}", v, info.source));
-    }
-
     if let Some(xff) = session.req_header().headers.get("x-forwarded-for") {
       if let Ok(v) = xff.to_str() {
         if resolved_ip != peer_addr {
-          extras.push(format!("xff: {}", resolved_ip));
+          tracing::debug!("[{}] xff resolved to {}", self.service_config.name, resolved_ip);
         } else if self
           .real_ip
           .as_ref()
           .map_or(false, |cfg| !cfg.is_trusted(peer_addr))
         {
-          extras.push(format!("xff: {}", v));
+          tracing::debug!("[{}] untrusted xff ignored: {}", self.service_config.name, v);
         }
       }
     }
-    let mut extra_str = String::new();
-    if is_untrusted {
-      extra_str.push_str("(untrusted) ");
-    }
-    for (i, e) in extras.iter().enumerate() {
-      extra_str.push_str(&format!("({})", e));
-      if i < extras.len() - 1 {
-        extra_str.push(' ');
-      }
-    }
 
-    if extra_str.is_empty() {
-      tracing::info!(
-        "[{}] {} <- {}",
-        self.service_config.name,
-        self.listen_addr,
-        physical_fmt
-      );
-    } else {
-      tracing::info!(
-        "[{}] {} <- {} {}",
-        self.service_config.name,
-        self.listen_addr,
-        physical_fmt,
-        extra_str
-      );
-    }
+    tracing::info!(
+      "{}",
+      crate::core::logging::format_connection_log(
+        &self.service_config.name,
+        &self.listen_addr,
+        &physical_fmt,
+        proxy_info.as_ref(),
+        is_untrusted,
+        Some(&host),
+      )
+    );
 
     // 2. Audit Info
     ctx.method = match session.req_header().method.as_str() {
@@ -219,17 +218,7 @@ impl ProxyHttp for TrauditProxy {
       _ => HttpMethod::Other,
     };
     ctx.path = session.req_header().uri.path().to_string();
-    ctx.host = session
-      .req_header()
-      .uri
-      .host()
-      .map(|h| h.to_string())
-      .unwrap_or_default();
-    if ctx.host.is_empty() {
-      if let Some(h) = session.req_header().headers.get("host") {
-        ctx.host = h.to_str().unwrap_or("").to_string();
-      }
-    }
+    ctx.host = host;
 
     ctx.user_agent = session
       .req_header()
