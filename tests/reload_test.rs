@@ -11,6 +11,40 @@ use warp::Filter;
 // Shared stats
 static BYTES_SENT: AtomicUsize = AtomicUsize::new(0);
 
+async fn matching_pids(config_path: &std::path::Path) -> anyhow::Result<Vec<i32>> {
+  let output = Command::new("pgrep")
+    .arg("-f")
+    .arg(config_path.to_string_lossy().to_string())
+    .output()
+    .await?;
+
+  if !output.status.success() && output.stdout.is_empty() {
+    return Ok(Vec::new());
+  }
+
+  let pid_str = String::from_utf8(output.stdout)?;
+  Ok(
+    pid_str
+      .lines()
+      .filter_map(|line| line.trim().parse::<i32>().ok())
+      .collect(),
+  )
+}
+
+async fn wait_for_processes_to_exit(config_path: &std::path::Path) -> anyhow::Result<()> {
+  for _ in 0..60 {
+    if matching_pids(config_path).await?.is_empty() {
+      return Ok(());
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+  }
+
+  anyhow::bail!(
+    "timed out waiting for traudit processes to exit for {}",
+    config_path.display()
+  )
+}
+
 #[tokio::test]
 async fn test_reload_stress() -> anyhow::Result<()> {
   // Setup Environment: Initialize DB and clear tables
@@ -227,12 +261,12 @@ services:
   tokio::time::sleep(Duration::from_secs(5)).await;
 
   // Send SIGHUP
-  let output = Command::new("pgrep")
-    .arg("-f")
-    .arg(&config_path.to_string_lossy().to_string())
-    .output()
-    .await?;
-  let pid_str = String::from_utf8(output.stdout)?;
+  let pid_str = matching_pids(&config_path)
+    .await?
+    .into_iter()
+    .map(|pid| pid.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
   println!("Found PIDs for Reload: {}", pid_str);
 
   for line in pid_str.lines() {
@@ -256,12 +290,12 @@ services:
   tokio::time::sleep(Duration::from_secs(3)).await;
 
   // Kill traudit
-  let output = Command::new("pgrep")
-    .arg("-f")
-    .arg(&config_path.to_string_lossy().to_string())
-    .output()
-    .await?;
-  let pid_str = String::from_utf8(output.stdout)?;
+  let pid_str = matching_pids(&config_path)
+    .await?
+    .into_iter()
+    .map(|pid| pid.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
   for line in pid_str.lines() {
     if let Ok(pid) = line.trim().parse::<i32>() {
       let _ = nix::sys::signal::kill(
@@ -271,8 +305,8 @@ services:
     }
   }
 
-  // Wait for buffered records to flush (batch_timeout_secs: 1)
-  tokio::time::sleep(Duration::from_secs(3)).await;
+  wait_for_processes_to_exit(&config_path).await?;
+  tokio::time::sleep(Duration::from_secs(2)).await;
 
   // Verify: Aggregated DB logs must cover Client payload (DB >= Client due to headers)
   let client_sent = BYTES_SENT.load(Ordering::SeqCst) as u64;
