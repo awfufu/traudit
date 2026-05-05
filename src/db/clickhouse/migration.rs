@@ -20,9 +20,11 @@ impl Migrator {
     self.ensure_migration_table().await?;
 
     let current_version = self.get_current_version().await?;
-    let target_version = VERSION_LIST.last().unwrap();
+    let Some(&target_version) = VERSION_LIST.last() else {
+      return Err(anyhow::anyhow!("migration version list is empty"));
+    };
 
-    if current_version.is_none() {
+    let Some(current_ver_str) = current_version else {
       // Fresh install: Bootstrap directly to latest
       info!(
         "fresh install detected, bootstrapping to {}",
@@ -31,9 +33,7 @@ impl Migrator {
       self.bootstrap_latest().await?;
       self.record_migration(target_version).await?;
       return Ok(());
-    }
-
-    let current_ver_str = current_version.unwrap();
+    };
 
     // Iterative upgrade
     for &version in VERSION_LIST {

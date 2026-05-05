@@ -132,8 +132,13 @@ async fn main() -> anyhow::Result<()> {
 
       // Prepare FDs to pass
       let fd_map = {
-          let registry = traudit::core::server::listener::get_fd_registry().lock().unwrap();
-          registry.clone()
+          match traudit::core::server::listener::get_fd_registry().lock() {
+            Ok(registry) => registry.clone(),
+            Err(poisoned) => {
+              error!("fd registry lock poisoned during reload, continuing with current state");
+              poisoned.into_inner().clone()
+            }
+          }
       };
 
       let fd_json = serde_json::to_string(&fd_map).unwrap_or_default();

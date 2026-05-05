@@ -229,17 +229,21 @@ impl ClickHouseLogger {
   }
 
   fn reload_buffer_path(&self) -> PathBuf {
-    let mut url =
-      url::Url::parse(&self.config.dsn).unwrap_or_else(|_| url::Url::parse("http://invalid/traudit").unwrap());
-    let db_name = url
-      .path_segments()
-      .and_then(|mut segments| segments.next())
-      .filter(|db| !db.is_empty())
-      .unwrap_or("traudit")
-      .to_string();
-    url.set_password(None).ok();
+    let (db_name, dsn_for_hash) = match url::Url::parse(&self.config.dsn) {
+      Ok(mut url) => {
+        let db_name = url
+          .path_segments()
+          .and_then(|mut segments| segments.next())
+          .filter(|db| !db.is_empty())
+          .unwrap_or("traudit")
+          .to_string();
+        url.set_password(None).ok();
+        (db_name, url.to_string())
+      }
+      Err(_) => ("traudit".to_string(), self.config.dsn.clone()),
+    };
     let mut hasher = DefaultHasher::new();
-    format!("{}:{}", db_name, url.as_str()).hash(&mut hasher);
+    format!("{}:{}", db_name, dsn_for_hash).hash(&mut hasher);
     PathBuf::from(format!(
       "/tmp/traudit-reload-buffer-{:x}.json",
       hasher.finish()
@@ -355,7 +359,9 @@ impl ClickHouseLogger {
         break;
       }
 
-      let next = queue.logs.pop_front().expect("front element disappeared");
+      let Some(next) = queue.logs.pop_front() else {
+        break;
+      };
       queue.total_bytes = queue.total_bytes.saturating_sub(next.estimated_size());
       batch.push(next);
     }

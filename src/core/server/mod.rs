@@ -202,8 +202,10 @@ pub async fn run(
           redirect_https,
         };
         let mut service_obj = http_proxy_service(&conf, inner_proxy);
+        let app_ptr = service_obj
+          .app_logic_mut()
+          .ok_or_else(|| anyhow::anyhow!("http proxy app logic missing"))?;
         let app = unsafe {
-          let app_ptr = service_obj.app_logic_mut().expect("app logic missing");
           std::ptr::read(app_ptr)
         };
         std::mem::forget(service_obj);

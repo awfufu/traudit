@@ -442,7 +442,7 @@ pub async fn serve_listener_loop<F, Fut>(
                 InboundStream::Tcp(s) => s.local_addr().ok(),
                 _ => None,
               }
-              .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+              .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
 
               // 3. Construct base PingoraStream
               let stream = PingoraStream::new(
