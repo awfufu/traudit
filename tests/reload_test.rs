@@ -12,23 +12,46 @@ use warp::Filter;
 static BYTES_SENT: AtomicUsize = AtomicUsize::new(0);
 
 async fn matching_pids(config_path: &std::path::Path) -> anyhow::Result<Vec<i32>> {
-  let output = Command::new("pgrep")
-    .arg("-f")
-    .arg(config_path.to_string_lossy().to_string())
+  let path_str = config_path.to_string_lossy().to_string();
+  let output = Command::new("ps")
+    .args(["-eo", "pid=,stat=,args="])
     .output()
     .await?;
 
-  if !output.status.success() && output.stdout.is_empty() {
-    return Ok(Vec::new());
+  if !output.status.success() {
+    anyhow::bail!(
+      "ps failed: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
   }
 
-  let pid_str = String::from_utf8(output.stdout)?;
-  Ok(
-    pid_str
-      .lines()
-      .filter_map(|line| line.trim().parse::<i32>().ok())
-      .collect(),
-  )
+  let output_str = String::from_utf8(output.stdout)?;
+  let mut pids = Vec::new();
+
+  for line in output_str.lines() {
+    if !line.contains(&path_str) {
+      continue;
+    }
+
+    let mut parts = line.split_whitespace();
+    let Some(pid_str) = parts.next() else {
+      continue;
+    };
+    let Some(stat) = parts.next() else {
+      continue;
+    };
+
+    // Ignore zombie processes that already exited but have not been reaped yet.
+    if stat.starts_with('Z') {
+      continue;
+    }
+
+    if let Ok(pid) = pid_str.parse::<i32>() {
+      pids.push(pid);
+    }
+  }
+
+  Ok(pids)
 }
 
 async fn wait_for_processes_to_exit(config_path: &std::path::Path) -> anyhow::Result<()> {
@@ -133,7 +156,7 @@ services:
     t_http_port
   );
 
-  let config_path = std::env::temp_dir().join("stress_test.yaml");
+  let config_path = std::env::temp_dir().join(format!("stress_test_{}.yaml", rand::random::<u64>()));
   std::fs::write(&config_path, config_content)?;
 
   // Pre-build to ensure cargo run doesn't time out compiling
@@ -275,6 +298,11 @@ services:
     }
   }
 
+  // Reap the original child process if it exited during reload so it doesn't remain as a zombie.
+  if let Ok(Some(_)) = _child.try_wait() {
+    let _ = _child.wait().await;
+  }
+
   // Wait remaining time
   tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -301,6 +329,9 @@ services:
       );
     }
   }
+
+  // Ensure the original child is reaped even if a reloaded child handled the SIGINT.
+  let _ = tokio::time::timeout(Duration::from_secs(30), _child.wait()).await;
 
   wait_for_processes_to_exit(&config_path).await?;
   tokio::time::sleep(Duration::from_secs(2)).await;
