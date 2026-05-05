@@ -168,7 +168,7 @@ pub async fn run(
           proxy_proto_config,
           tls_acceptor,
           shutdown_rx,
-          move |stream, info, client_addr| {
+          move |stream, info, client_addr, _shutdown| {
             let db = db.clone();
             let svc = svc_cfg.clone();
             let addr = listen_addr_log.clone();
@@ -211,10 +211,6 @@ pub async fn run(
         std::mem::forget(service_obj);
         let app = Arc::new(app);
 
-        // pass the REAL shutdown signal to serve_listener_loop.
-        let shutdown_dummy =
-          pingora::server::ShutdownWatch::from(tokio::sync::watch::channel(false).1);
-
         join_set.spawn(serve_listener_loop(
           listener,
           service_config,
@@ -222,9 +218,8 @@ pub async fn run(
           proxy_proto_config,
           tls_acceptor,
           shutdown_rx,
-          move |stream, info, client_addr| {
+          move |stream, info, client_addr, shutdown| {
             let app = app.clone();
-            let shutdown = shutdown_dummy.clone();
             async move {
               // stream is UnifiedPingoraStream
               // Coerce to Box<dyn IO> (trait object implementation check)

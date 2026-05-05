@@ -312,7 +312,12 @@ pub async fn serve_listener_loop<F, Fut>(
   mut shutdown_rx: tokio::sync::broadcast::Receiver<crate::core::server::ShutdownReason>,
   handler: F,
 ) where
-  F: Fn(UnifiedPingoraStream, Option<crate::protocol::ProxyInfo>, std::net::SocketAddr) -> Fut
+  F: Fn(
+      UnifiedPingoraStream,
+      Option<crate::protocol::ProxyInfo>,
+      std::net::SocketAddr,
+      pingora::server::ShutdownWatch,
+    ) -> Fut
     + Send
     + Sync
     + 'static
@@ -324,11 +329,13 @@ pub async fn serve_listener_loop<F, Fut>(
   // Track active connections
   let active_connections = Arc::new(AtomicUsize::new(0));
   let notify_shutdown = Arc::new(tokio::sync::Notify::new());
+  let (conn_shutdown_tx, conn_shutdown_rx) = tokio::sync::watch::channel(false);
 
   loop {
     tokio::select! {
       _ = shutdown_rx.recv() => {
         info!("[{}] shutdown signal received, stopping acceptance", service.name);
+        let _ = conn_shutdown_tx.send(true);
         break;
       }
       accept_res = listener.accept() => {
@@ -339,6 +346,7 @@ pub async fn serve_listener_loop<F, Fut>(
             let real_ip_config = real_ip_config.clone();
             let handler = handler.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let conn_shutdown = pingora::server::ShutdownWatch::from(conn_shutdown_rx.clone());
 
             // Increment counter
             active_connections.fetch_add(1, Ordering::SeqCst);
@@ -484,7 +492,7 @@ pub async fn serve_listener_loop<F, Fut>(
               };
 
               // 5. Handler
-              handler(stream, proxy_info, client_addr).await;
+              handler(stream, proxy_info, client_addr, conn_shutdown).await;
             });
           }
           Err(e) => {
