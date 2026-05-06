@@ -428,31 +428,51 @@ impl ClickHouseLogger {
   pub async fn shutdown(&self, reason: ShutdownReason) {
     self.reconnect_notify.notify_waiters();
 
-    if self.client.read().await.is_none() {
-      match Self::build_client(&self.config) {
-        Ok(client) => match Self::init_client(&client).await {
-          Ok(()) => {
-            *self.client.write().await = Some(client);
-            info!("connected to database during shutdown drain");
+    match reason {
+      ShutdownReason::Reload => {
+        if self.client.read().await.is_none() {
+          match Self::build_client(&self.config) {
+            Ok(client) => match Self::init_client(&client).await {
+              Ok(()) => {
+                *self.client.write().await = Some(client);
+                info!("connected to database during shutdown drain");
+              }
+              Err(e) => {
+                warn!("failed to connect database during shutdown drain: {}", e);
+                return;
+              }
+            },
+            Err(e) => {
+              warn!("failed to build database client during shutdown drain: {}", e);
+              return;
+            }
           }
-          Err(e) => {
-            warn!("failed to connect database during shutdown drain: {}", e);
-            return;
-          }
-        },
-        Err(e) => {
-          warn!("failed to build database client during shutdown drain: {}", e);
-          return;
+        }
+
+        if let Err(e) = self.flush_pending_logs().await {
+          warn!("failed to flush pending audit logs during shutdown: {}", e);
+        }
+
+        if self.has_pending_logs().await {
+          self.export_reload_buffer().await;
         }
       }
-    }
-
-    if let Err(e) = self.flush_pending_logs().await {
-      warn!("failed to flush pending audit logs during shutdown: {}", e);
-    }
-
-    if reason == ShutdownReason::Reload && self.has_pending_logs().await {
-      self.export_reload_buffer().await;
+      ShutdownReason::Terminate => {
+        if self.client.read().await.is_some() {
+          if let Err(e) = self.flush_pending_logs().await {
+            warn!("failed to flush pending audit logs during shutdown: {}", e);
+          }
+        } else if self.has_pending_logs().await {
+          let mut queue = self.queue.lock().await;
+          let dropped = queue.logs.len();
+          queue.logs.clear();
+          queue.total_bytes = 0;
+          warn!(
+            "database disconnected during terminate; dropped {} pending audit logs",
+            dropped
+          );
+        }
+      }
     }
   }
 

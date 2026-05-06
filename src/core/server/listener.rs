@@ -325,15 +325,18 @@ pub async fn serve_listener_loop<F, Fut>(
   Fut: std::future::Future<Output = ()> + Send,
 {
   use std::sync::atomic::{AtomicUsize, Ordering};
-
   // Track active connections
   let active_connections = Arc::new(AtomicUsize::new(0));
   let notify_shutdown = Arc::new(tokio::sync::Notify::new());
   let (conn_shutdown_tx, conn_shutdown_rx) = tokio::sync::watch::channel(false);
+  let mut shutdown_reason = crate::core::server::ShutdownReason::Terminate;
 
   loop {
     tokio::select! {
-      _ = shutdown_rx.recv() => {
+      recv_res = shutdown_rx.recv() => {
+        if let Ok(reason) = recv_res {
+          shutdown_reason = reason;
+        }
         info!("[{}] shutdown signal received, stopping acceptance", service.name);
         let _ = conn_shutdown_tx.send(true);
         break;
@@ -503,9 +506,22 @@ pub async fn serve_listener_loop<F, Fut>(
     }
   }
 
-  // Graceful shutdown: wait for active connections
   drop(listener); // Close socket immediately
 
+  if shutdown_reason == crate::core::server::ShutdownReason::Terminate {
+    let remaining = active_connections.load(Ordering::SeqCst);
+    if remaining > 0 {
+      warn!(
+        "[{}] terminating with {} active connections, forcing disconnect",
+        service.name,
+        remaining
+      );
+    }
+    info!("[{}] shutdown complete", service.name);
+    return;
+  }
+
+  // Graceful shutdown for reload: wait for active connections to drain.
   if active_connections.load(Ordering::SeqCst) > 0 {
     info!(
       "[{}] waiting for {} active connections...",

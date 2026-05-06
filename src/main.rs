@@ -191,12 +191,12 @@ async fn main() -> anyhow::Result<()> {
       let _ = server_handle.await;
     }
     _ = sigint.recv() => {
-      info!("received SIGINT, shutting down gracefully...");
+      info!("received SIGINT, terminating immediately...");
       let _ = shutdown_tx.send(traudit::core::server::ShutdownReason::Terminate);
       let _ = server_handle.await;
     }
     _ = sigterm.recv() => {
-      info!("received SIGTERM, shutting down gracefully...");
+      info!("received SIGTERM, terminating immediately...");
       let _ = shutdown_tx.send(traudit::core::server::ShutdownReason::Terminate);
       let _ = server_handle.await;
     }
