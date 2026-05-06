@@ -10,7 +10,6 @@ ExecStart=/usr/bin/traudit -f /etc/traudit/config.yaml
 ExecReload=/usr/bin/traudit -f /etc/traudit/config.yaml -t
 ExecReload=/bin/kill -HUP $MAINPID
 KillSignal=SIGTERM
-RestartKillSignal=SIGHUP
 Restart=on-failure
 RestartSec=5s
 

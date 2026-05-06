@@ -83,12 +83,18 @@ pub fn get_fd_registry(
   FD_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+pub fn fd_registry_key(service_name: &str, addr_str: &str) -> String {
+  format!("{}|{}", service_name, addr_str)
+}
+
 pub async fn bind_listener(
   addr_str: &str,
   mode: u32,
   service_name: &str,
 ) -> anyhow::Result<UnifiedListener> {
   use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+
+  let registry_key = fd_registry_key(service_name, addr_str);
 
   // Check if we inherited an FD for this service
   let inherited_fds_json = std::env::var("TRAUDIT_INHERITED_FDS").ok();
@@ -97,7 +103,7 @@ pub async fn bind_listener(
   if let Some(json) = inherited_fds_json {
     let map: std::collections::HashMap<String, RawFd> =
       serde_json::from_str(&json).unwrap_or_default();
-    if let Some(&fd) = map.get(service_name) {
+    if let Some(&fd) = map.get(&registry_key) {
       info!("[{}] inherited fd: {}", service_name, fd);
       inherited_fd = Some(fd);
     }
@@ -260,14 +266,14 @@ pub async fn bind_listener(
   get_fd_registry()
     .lock()
     .unwrap()
-    .insert(service_name.to_string(), dup_fd);
+    .insert(registry_key, dup_fd);
 
   Ok(listener)
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{normalize_ipv4_mapped_addr, parse_tcp_bind_target};
+  use super::{fd_registry_key, normalize_ipv4_mapped_addr, parse_tcp_bind_target};
   use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
   #[test]
@@ -300,6 +306,12 @@ mod tests {
 
     let normal_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080);
     assert_eq!(normalize_ipv4_mapped_addr(normal_v6), normal_v6);
+  }
+
+  #[test]
+  fn test_fd_registry_key_is_unique_per_bind() {
+    assert_eq!(fd_registry_key("web", "127.0.0.1:80"), "web|127.0.0.1:80");
+    assert_ne!(fd_registry_key("web", "127.0.0.1:80"), fd_registry_key("web", "unix://http.sock"));
   }
 }
 
