@@ -2,6 +2,8 @@ use crate::config::Config;
 use crate::core::upstream::UpstreamStream;
 use crate::db::clickhouse::ClickHouseLogger;
 use pingora::apps::ServerApp;
+use std::io::Write;
+use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -21,6 +23,18 @@ use self::handler::handle_connection;
 use self::listener::{bind_listener, serve_listener_loop, UnifiedListener};
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 
+fn notify_reload_parent_ready() -> anyhow::Result<()> {
+  let Ok(fd_str) = std::env::var("TRAUDIT_RELOAD_READY_FD") else {
+    return Ok(());
+  };
+
+  let fd: i32 = fd_str.parse()?;
+  let mut stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+  stream.write_all(&[1])?;
+  stream.flush()?;
+  Ok(())
+}
+
 pub async fn run(
   config: Config,
   shutdown_tx: tokio::sync::broadcast::Sender<ShutdownReason>,
@@ -36,6 +50,7 @@ pub async fn run(
 
   // JoinSet to manage all server tasks
   let mut join_set = tokio::task::JoinSet::new();
+  let (startup_tx, startup_rx) = tokio::sync::watch::channel(false);
 
   for service in config.services {
     let db = db.clone();
@@ -142,6 +157,7 @@ pub async fn run(
       }
 
       let shutdown_rx = shutdown_tx.subscribe();
+      let startup_rx = startup_rx.clone();
 
       if is_tcp_service {
         // --- TCP Handler (with startup check) ---
@@ -167,6 +183,7 @@ pub async fn run(
           real_ip_config.clone(),
           proxy_proto_config,
           tls_acceptor,
+          startup_rx,
           shutdown_rx,
           move |stream, info, client_addr, _shutdown| {
             let db = db.clone();
@@ -217,6 +234,7 @@ pub async fn run(
           real_ip_config,
           proxy_proto_config,
           tls_acceptor,
+          startup_rx,
           shutdown_rx,
           move |stream, info, client_addr, shutdown| {
             let app = app.clone();
@@ -251,6 +269,9 @@ pub async fn run(
       }
     }
   }
+
+  let _ = startup_tx.send(true);
+  notify_reload_parent_ready()?;
 
   // Wait for all server components to finish gracefully
   while let Some(res) = join_set.join_next().await {

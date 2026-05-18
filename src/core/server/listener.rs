@@ -321,6 +321,7 @@ pub async fn serve_listener_loop<F, Fut>(
   real_ip_config: Option<crate::config::RealIpConfig>,
   proxy_cfg: Option<String>,
   tls_acceptor: Option<Arc<SslAcceptor>>,
+  mut startup_rx: tokio::sync::watch::Receiver<bool>,
   mut shutdown_rx: tokio::sync::broadcast::Receiver<crate::core::server::ShutdownReason>,
   handler: F,
 ) where
@@ -337,6 +338,18 @@ pub async fn serve_listener_loop<F, Fut>(
   Fut: std::future::Future<Output = ()> + Send,
 {
   use std::sync::atomic::{AtomicUsize, Ordering};
+
+  if !*startup_rx.borrow() {
+    loop {
+      if startup_rx.changed().await.is_err() {
+        return;
+      }
+      if *startup_rx.borrow() {
+        break;
+      }
+    }
+  }
+
   // Track active connections
   let active_connections = Arc::new(AtomicUsize::new(0));
   let notify_shutdown = Arc::new(tokio::sync::Notify::new());

@@ -3,11 +3,15 @@ use traudit::core;
 
 use anyhow::bail;
 use std::env;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::signal;
 use tracing::{error, info};
 
 pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+const RELOAD_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn print_help() {
   println!("traudit - a reverse proxy with auditing capabilities");
@@ -150,45 +154,75 @@ async fn main() -> anyhow::Result<()> {
       cmd.args(&args[1..]);
       cmd.env("TRAUDIT_INHERITED_FDS", fd_json);
 
+      let (ready_parent, ready_child) = std::os::unix::net::UnixStream::pair()?;
+      ready_parent.set_nonblocking(true)?;
+      let ready_fd = ready_child.as_raw_fd();
+      cmd.env("TRAUDIT_RELOAD_READY_FD", ready_fd.to_string());
+
       unsafe {
           // Use pre_exec to clear CLOEXEC on the FDs to be inherited.
           let fd_map_for_closure = fd_map.clone();
 
           use std::os::unix::process::CommandExt;
-          cmd.pre_exec(move || {
-              for (_, &fd) in &fd_map_for_closure {
-                  // Clear FD_CLOEXEC flag
-                  let flags = libc::fcntl(fd, libc::F_GETFD);
-                  if flags >= 0 {
-                      libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-                  }
-              }
-              Ok(())
-          });
-      }
+           cmd.pre_exec(move || {
+               for (_, &fd) in &fd_map_for_closure {
+                   // Clear FD_CLOEXEC flag
+                   let flags = libc::fcntl(fd, libc::F_GETFD);
+                   if flags >= 0 {
+                       libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                   }
+               }
 
-      match cmd.spawn() {
+               let ready_flags = libc::fcntl(ready_fd, libc::F_GETFD);
+               if ready_flags >= 0 {
+                   libc::fcntl(ready_fd, libc::F_SETFD, ready_flags & !libc::FD_CLOEXEC);
+               }
+               Ok(())
+           });
+       }
+
+       match cmd.spawn() {
           Ok(child) => {
             let child_pid = child.id();
             info!("spawned new process with pid: {}", child_pid);
+            drop(ready_child);
 
-            // Notify systemd of NEW main PID so it doesn't kill the service when we exit
-            if let Ok(notify_socket) = std::env::var("NOTIFY_SOCKET") {
-              if let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() {
-                let msg = format!("MAINPID={}\n", child_pid);
-                if let Err(e) = sock.send_to(msg.as_bytes(), notify_socket) {
-                    error!("failed to send MAINPID to systemd: {}", e);
+            let mut ready_stream = tokio::net::UnixStream::from_std(ready_parent)?;
+            let mut ready_buf = [0u8; 1];
+            match tokio::time::timeout(RELOAD_READY_TIMEOUT, ready_stream.read_exact(&mut ready_buf)).await {
+              Ok(Ok(_)) => {
+                info!("new process reported ready; starting graceful handoff");
+
+                // Notify systemd of NEW main PID so it doesn't kill the service when we exit
+                if let Ok(notify_socket) = std::env::var("NOTIFY_SOCKET") {
+                  if let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() {
+                    let msg = format!("MAINPID={}\n", child_pid);
+                    if let Err(e) = sock.send_to(msg.as_bytes(), notify_socket) {
+                        error!("failed to send MAINPID to systemd: {}", e);
+                    }
+                  }
                 }
+
+                info!("shutting down old process gracefully (draining connections)...");
+                let _ = shutdown_tx.send(traudit::core::server::ShutdownReason::Reload);
+                let _ = server_handle.await;
+              }
+              Ok(Err(e)) => {
+                error!("new process exited before reporting ready: {}", e);
+              }
+              Err(_) => {
+                error!(
+                  "new process did not report ready within {}s; keeping current process active",
+                  RELOAD_READY_TIMEOUT.as_secs()
+                );
               }
             }
           },
-          Err(e) => error!("failed to spawn new process: {}", e),
-      }
-      // Initiate graceful shutdown for this process
-      info!("shutting down old process gracefully (draining connections)...");
-      let _ = shutdown_tx.send(traudit::core::server::ShutdownReason::Reload);
-      // Wait for server to finish (graceful drain)
-      let _ = server_handle.await;
+          Err(e) => {
+            drop(ready_child);
+            error!("failed to spawn new process: {}", e);
+          }
+       }
     }
     _ = sigint.recv() => {
       info!("received SIGINT, terminating immediately...");
