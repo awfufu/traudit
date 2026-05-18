@@ -1,5 +1,6 @@
 use crate::core::upstream::AsyncStream;
 use std::io;
+use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 async fn splice_loop(
   read: &AsyncStream,
@@ -102,6 +103,80 @@ pub async fn zero_copy_bidirectional(
     return (metrics, Err(e));
   }
   if let Err(e) = s2c_res {
+    return (metrics, Err(e));
+  }
+
+  (metrics, Ok(()))
+}
+
+async fn copy_with_shutdown<R, W>(
+  read: &mut R,
+  write: &mut W,
+  mut shutdown: pingora::server::ShutdownWatch,
+) -> io::Result<u64>
+where
+  R: AsyncRead + Unpin,
+  W: AsyncWrite + Unpin,
+{
+  let mut total = 0;
+  let mut buf = [0u8; 16 * 1024];
+
+  loop {
+    let read_res = tokio::select! {
+      res = read.read(&mut buf) => res,
+      _ = async {
+        if !*shutdown.borrow() {
+          let _ = shutdown.changed().await;
+        }
+      } => {
+        let _ = write.shutdown().await;
+        return Ok(total);
+      }
+    }?;
+
+    if read_res == 0 {
+      write.shutdown().await?;
+      return Ok(total);
+    }
+
+    write.write_all(&buf[..read_res]).await?;
+    total += read_res as u64;
+  }
+}
+
+pub async fn copy_bidirectional_with_shutdown<A, B>(
+  a: &mut A,
+  b: &mut B,
+  shutdown: pingora::server::ShutdownWatch,
+) -> ((u64, u64), io::Result<()>)
+where
+  A: AsyncRead + AsyncWrite + Unpin,
+  B: AsyncRead + AsyncWrite + Unpin,
+{
+  let (mut a_read, mut a_write) = split(a);
+  let (mut b_read, mut b_write) = split(b);
+  let shutdown_a_to_b = shutdown.clone();
+  let shutdown_b_to_a = shutdown.clone();
+
+  let ((a_to_b, a_res), (b_to_a, b_res)) = tokio::join!(
+    async {
+      let res = copy_with_shutdown(&mut a_read, &mut b_write, shutdown_a_to_b).await;
+      let _ = b_write.shutdown().await;
+      (res.as_ref().copied().unwrap_or(0), res)
+    },
+    async {
+      let res = copy_with_shutdown(&mut b_read, &mut a_write, shutdown_b_to_a).await;
+      let _ = a_write.shutdown().await;
+      (res.as_ref().copied().unwrap_or(0), res)
+    }
+  );
+
+  let metrics = (b_to_a, a_to_b);
+
+  if let Err(e) = a_res {
+    return (metrics, Err(e));
+  }
+  if let Err(e) = b_res {
     return (metrics, Err(e));
   }
 

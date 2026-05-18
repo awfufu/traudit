@@ -186,17 +186,18 @@ pub async fn handle_connection(
     }
   } else if let Some(mut stream) = generic_stream {
     // Generic Copy Path (TLS): internal buffer is automatically handled by the stream wrapper.
-    match tokio::io::copy_bidirectional(&mut stream, &mut upstream).await {
-      Ok((s2c, c2s)) => {
-        bytes_sent = s2c;
-        bytes_recv = c2s;
-      }
-      Err(e) => match e.kind() {
+    let ((s2c, c2s), res) =
+      forwarder::copy_bidirectional_with_shutdown(&mut stream, &mut upstream, shutdown).await;
+    bytes_sent = s2c;
+    bytes_recv = c2s;
+
+    if let Err(e) = res {
+      match e.kind() {
         std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
           tracing::debug!("[{}] connection closed: {}", service.name, e);
         }
         _ => error!("[{}] connection error: {}", service.name, e),
-      },
+      }
     }
   }
 
