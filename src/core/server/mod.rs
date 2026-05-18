@@ -185,14 +185,23 @@ pub async fn run(
           tls_acceptor,
           startup_rx,
           shutdown_rx,
-          move |stream, info, client_addr, _shutdown| {
+          move |stream, info, client_addr, shutdown| {
             let db = db.clone();
             let svc = svc_cfg.clone();
             let addr = listen_addr_log.clone();
             let real_ip_cloned = real_ip_config.clone();
             async move {
-              if let Err(e) =
-                handle_connection(stream, info, svc, db, addr, client_addr, real_ip_cloned).await
+              if let Err(e) = handle_connection(
+                stream,
+                info,
+                svc,
+                db,
+                addr,
+                client_addr,
+                real_ip_cloned,
+                shutdown,
+              )
+              .await
               {
                 match e.kind() {
                   std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {

@@ -112,16 +112,34 @@ impl AsyncStream {
   }
 
   pub async fn splice_read(&self, pipe_out: RawFd, len: usize) -> io::Result<usize> {
+    self.splice_read_with_shutdown(pipe_out, len, None).await
+  }
+
+  pub async fn splice_read_with_shutdown(
+    &self,
+    pipe_out: RawFd,
+    len: usize,
+    shutdown: Option<&mut pingora::server::ShutdownWatch>,
+  ) -> io::Result<usize> {
     match self {
-      AsyncStream::Tcp(fd) => perform_splice_read(fd, pipe_out, len).await,
-      AsyncStream::Unix(fd) => perform_splice_read(fd, pipe_out, len).await,
+      AsyncStream::Tcp(fd) => perform_splice_read(fd, pipe_out, len, shutdown).await,
+      AsyncStream::Unix(fd) => perform_splice_read(fd, pipe_out, len, shutdown).await,
     }
   }
 
   pub async fn splice_write(&self, pipe_in: RawFd, len: usize) -> io::Result<usize> {
+    self.splice_write_with_shutdown(pipe_in, len, None).await
+  }
+
+  pub async fn splice_write_with_shutdown(
+    &self,
+    pipe_in: RawFd,
+    len: usize,
+    shutdown: Option<&mut pingora::server::ShutdownWatch>,
+  ) -> io::Result<usize> {
     match self {
-      AsyncStream::Tcp(fd) => perform_splice_write(fd, pipe_in, len).await,
-      AsyncStream::Unix(fd) => perform_splice_write(fd, pipe_in, len).await,
+      AsyncStream::Tcp(fd) => perform_splice_write(fd, pipe_in, len, shutdown).await,
+      AsyncStream::Unix(fd) => perform_splice_write(fd, pipe_in, len, shutdown).await,
     }
   }
 
@@ -137,9 +155,22 @@ async fn perform_splice_read<T: AsRawFd>(
   fd: &tokio::io::unix::AsyncFd<T>,
   pipe_out: RawFd,
   len: usize,
+  mut shutdown: Option<&mut pingora::server::ShutdownWatch>,
 ) -> io::Result<usize> {
   loop {
-    let mut guard = fd.readable().await?;
+    let mut guard = if let Some(shutdown) = shutdown.as_mut() {
+      if *shutdown.borrow() {
+        return Ok(0);
+      }
+
+      tokio::select! {
+        res = fd.readable() => res?,
+        _ = shutdown.changed() => return Ok(0),
+      }
+    } else {
+      fd.readable().await?
+    };
+
     match guard.try_io(|inner| unsafe {
       let res = libc::splice(
         inner.as_raw_fd(),
@@ -165,9 +196,22 @@ async fn perform_splice_write<T: AsRawFd>(
   fd: &tokio::io::unix::AsyncFd<T>,
   pipe_in: RawFd,
   len: usize,
+  mut shutdown: Option<&mut pingora::server::ShutdownWatch>,
 ) -> io::Result<usize> {
   loop {
-    let mut guard = fd.writable().await?;
+    let mut guard = if let Some(shutdown) = shutdown.as_mut() {
+      if *shutdown.borrow() {
+        return Ok(0);
+      }
+
+      tokio::select! {
+        res = fd.writable() => res?,
+        _ = shutdown.changed() => return Ok(0),
+      }
+    } else {
+      fd.writable().await?
+    };
+
     match guard.try_io(|inner| unsafe {
       let res = libc::splice(
         pipe_in,

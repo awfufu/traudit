@@ -21,6 +21,7 @@ pub async fn handle_connection(
   listen_addr: String,
   physical_addr: SocketAddr,
   real_ip_config: Option<RealIpConfig>,
+  shutdown: pingora::server::ShutdownWatch,
 ) -> std::io::Result<u64> {
   let conn_ts = time::OffsetDateTime::now_utc();
   let start_instant = std::time::Instant::now();
@@ -169,7 +170,8 @@ pub async fn handle_connection(
     };
     let upstream_async = upstream.into_async_stream()?;
 
-    let ((s2c, c2s), res) = forwarder::zero_copy_bidirectional(inbound_async, upstream_async).await;
+    let ((s2c, c2s), res) =
+      forwarder::zero_copy_bidirectional(inbound_async, upstream_async, shutdown.clone()).await;
 
     bytes_sent = s2c;
     bytes_recv = c2s;

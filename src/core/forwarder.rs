@@ -1,7 +1,11 @@
 use crate::core::upstream::AsyncStream;
 use std::io;
 
-async fn splice_loop(read: &AsyncStream, write: &AsyncStream) -> (u64, io::Result<()>) {
+async fn splice_loop(
+  read: &AsyncStream,
+  write: &AsyncStream,
+  mut shutdown: pingora::server::ShutdownWatch,
+) -> (u64, io::Result<()>) {
   let mut pipe = [0i32; 2];
   if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
     return (0, Err(io::Error::last_os_error()));
@@ -22,8 +26,15 @@ async fn splice_loop(read: &AsyncStream, write: &AsyncStream) -> (u64, io::Resul
   let mut total_bytes = 0;
 
   loop {
+    if *shutdown.borrow() {
+      return (total_bytes, Ok(()));
+    }
+
     // src -> pipe
-    let len = match read.splice_read(pipe_wr, 65536).await {
+    let len = match read
+      .splice_read_with_shutdown(pipe_wr, 65536, Some(&mut shutdown))
+      .await
+    {
       Ok(0) => return (total_bytes, Ok(())), // EOF
       Ok(n) => n,
       Err(e) => return (total_bytes, Err(e)),
@@ -32,8 +43,15 @@ async fn splice_loop(read: &AsyncStream, write: &AsyncStream) -> (u64, io::Resul
     // pipe -> dst
     let mut written = 0;
     while written < len {
+      if *shutdown.borrow() {
+        return (total_bytes, Ok(()));
+      }
+
       let to_write = len - written;
-      match write.splice_write(pipe_rd, to_write).await {
+      match write
+        .splice_write_with_shutdown(pipe_rd, to_write, Some(&mut shutdown))
+        .await
+      {
         Ok(0) => {
           return (
             total_bytes,
@@ -56,16 +74,20 @@ async fn splice_loop(read: &AsyncStream, write: &AsyncStream) -> (u64, io::Resul
 pub async fn zero_copy_bidirectional(
   inbound: AsyncStream,
   outbound: AsyncStream,
+  shutdown: pingora::server::ShutdownWatch,
 ) -> ((u64, u64), io::Result<()>) {
+  let shutdown_c2s = shutdown.clone();
+  let shutdown_s2c = shutdown.clone();
+
   // We own the streams now, so we can split references to them for the join.
   let ((c2s_bytes, c2s_res), (s2c_bytes, s2c_res)) = tokio::join!(
     async {
-      let res = splice_loop(&inbound, &outbound).await;
+      let res = splice_loop(&inbound, &outbound, shutdown_c2s).await;
       let _ = outbound.shutdown_write();
       res
     },
     async {
-      let res = splice_loop(&outbound, &inbound).await;
+      let res = splice_loop(&outbound, &inbound, shutdown_s2c).await;
       let _ = inbound.shutdown_write();
       res
     }
