@@ -100,7 +100,7 @@ pub async fn run(
       };
 
       let listen_type = match &listener {
-        UnifiedListener::Unix(_, _) => "unix",
+        UnifiedListener::Unix(..) => "unix",
         UnifiedListener::Tcp(_) => "tcp",
       };
 

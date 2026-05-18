@@ -41,12 +41,15 @@ fn parse_tcp_bind_target(addr_str: &str) -> anyhow::Result<(std::net::SocketAddr
 
 pub enum UnifiedListener {
   Tcp(TcpListener),
-  Unix(UnixListener, PathBuf), // PathBuf for cleanup on Drop
+  Unix(UnixListener, PathBuf, bool), // PathBuf for cleanup on Drop
 }
 
 impl Drop for UnifiedListener {
   fn drop(&mut self) {
-    if let UnifiedListener::Unix(_, ref path) = self {
+    if let UnifiedListener::Unix(_, ref path, cleanup) = self {
+      if !*cleanup {
+        return;
+      }
       let _ = std::fs::remove_file(path);
       tracing::debug!("removed socket file {:?}", path);
     }
@@ -60,7 +63,7 @@ impl UnifiedListener {
         let (stream, addr) = l.accept().await?;
         Ok((InboundStream::Tcp(stream), normalize_ipv4_mapped_addr(addr)))
       }
-      UnifiedListener::Unix(l, _) => {
+      UnifiedListener::Unix(l, _, _) => {
         let (stream, _addr) = l.accept().await?;
         // Mock IPv4 loopback for Unix sockets
         let addr = std::net::SocketAddr::new(
@@ -117,7 +120,7 @@ pub async fn bind_listener(
       l.set_nonblocking(true)?;
       let l = UnixListener::from_std(l)?;
       let path = std::path::PathBuf::from(addr_str.trim_start_matches("unix://"));
-      UnifiedListener::Unix(l, path)
+      UnifiedListener::Unix(l, path, true)
     } else {
       let l = unsafe { std::net::TcpListener::from_raw_fd(fd) };
       l.set_nonblocking(true)?;
@@ -166,7 +169,7 @@ pub async fn bind_listener(
       }
     }
 
-    UnifiedListener::Unix(listener, path_buf)
+    UnifiedListener::Unix(listener, path_buf, true)
   } else {
     // TCP with SO_REUSEPORT
     use nix::sys::socket::{setsockopt, sockopt};
@@ -240,7 +243,7 @@ pub async fn bind_listener(
   // Register duplicated FD for reload to pass to the next process.
   let raw_fd = match &listener {
     UnifiedListener::Tcp(l) => l.as_raw_fd(),
-    UnifiedListener::Unix(l, _) => l.as_raw_fd(),
+    UnifiedListener::Unix(l, _, _) => l.as_raw_fd(),
   };
 
   // Use libc for dup to avoid nix version issues
@@ -316,7 +319,7 @@ mod tests {
 }
 
 pub async fn serve_listener_loop<F, Fut>(
-  listener: UnifiedListener,
+  mut listener: UnifiedListener,
   service: ServiceConfig,
   real_ip_config: Option<crate::config::RealIpConfig>,
   proxy_cfg: Option<String>,
@@ -528,6 +531,14 @@ pub async fn serve_listener_loop<F, Fut>(
           }
         }
       }
+    }
+  }
+
+  if shutdown_reason == crate::core::server::ShutdownReason::Reload {
+    if let UnifiedListener::Unix(_, _, cleanup) = &mut listener {
+      // The new process inherits the same listening fd, so the old process must
+      // not unlink the shared socket path while draining existing connections.
+      *cleanup = false;
     }
   }
 
