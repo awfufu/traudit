@@ -7,9 +7,12 @@ use pingora::protocols::l4::socket::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio_openssl::SslStream;
 use tracing::{error, info, warn};
+
+const RELOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn normalize_ipv4_mapped_addr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
   match addr {
@@ -366,7 +369,9 @@ pub async fn serve_listener_loop<F, Fut>(
           shutdown_reason = reason;
         }
         info!("[{}] shutdown signal received, stopping acceptance", service.name);
-        let _ = conn_shutdown_tx.send(true);
+        if shutdown_reason == crate::core::server::ShutdownReason::Terminate {
+          let _ = conn_shutdown_tx.send(true);
+        }
         break;
       }
       accept_res = listener.accept() => {
@@ -564,7 +569,24 @@ pub async fn serve_listener_loop<F, Fut>(
       service.name,
       active_connections.load(Ordering::SeqCst)
     );
-    notify_shutdown.notified().await;
+
+    if tokio::time::timeout(RELOAD_DRAIN_TIMEOUT, notify_shutdown.notified())
+      .await
+      .is_err()
+    {
+      let remaining = active_connections.load(Ordering::SeqCst);
+      warn!(
+        "[{}] reload drain timed out after {}s with {} active connections, forcing shutdown",
+        service.name,
+        RELOAD_DRAIN_TIMEOUT.as_secs(),
+        remaining
+      );
+      let _ = conn_shutdown_tx.send(true);
+
+      if active_connections.load(Ordering::SeqCst) > 0 {
+        notify_shutdown.notified().await;
+      }
+    }
   }
   info!("[{}] shutdown complete", service.name);
 }
