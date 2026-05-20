@@ -21,9 +21,6 @@ services:
       # Entry 1: Public traffic from FRP
       - addr: "0.0.0.0:2223"
         proxy: "v2"
-        real_ip:
-          from: "proxy_protocol"
-          trust_private_ranges: true
 
       # Entry 2: LAN direct traffic (no Proxy Protocol)
       - addr: "0.0.0.0:2222"
@@ -41,7 +38,5 @@ services:
           key: "/path/to/key.key"
         proxy: v2
         real_ip:
-          from: "proxy_protocol"
-          trust_private_ranges: true
           trusted_proxies:
             - 1.2.3.4

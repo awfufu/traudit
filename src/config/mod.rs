@@ -143,7 +143,26 @@ pub struct RealIpConfig {
   pub xff_trust_depth: usize,
 }
 
+impl Default for RealIpConfig {
+  fn default() -> Self {
+    Self {
+      source: RealIpSource::RemoteAddr,
+      trusted_proxies: vec![],
+      trust_private_ranges: false,
+      xff_trust_depth: 0,
+    }
+  }
+}
+
 impl RealIpConfig {
+  pub fn proxy_protocol_default() -> Self {
+    Self {
+      source: RealIpSource::ProxyProtocol,
+      trust_private_ranges: true,
+      ..Self::default()
+    }
+  }
+
   pub fn is_trusted(&self, ip: IpAddr) -> bool {
     // Check explicit trusted proxies
     for net in &self.trusted_proxies {
@@ -258,7 +277,7 @@ impl Config {
 
     // Track unknown fields
     let mut unused = Vec::new();
-    let config: Config = serde_ignored::deserialize(deserializer, |path| {
+    let mut config: Config = serde_ignored::deserialize(deserializer, |path| {
       unused.push(path.to_string());
     })
     .map_err(|e| anyhow::anyhow!("failed to parse config: {}", e))?;
@@ -271,6 +290,8 @@ impl Config {
         path.as_ref().display()
       );
     }
+
+    config.apply_implicit_defaults();
 
     // Semantic validation
     config.validate()?;
@@ -409,6 +430,16 @@ impl Config {
     }
     Ok(())
   }
+
+  fn apply_implicit_defaults(&mut self) {
+    for service in &mut self.services {
+      for bind in &mut service.binds {
+        if bind.proxy.is_some() && bind.real_ip.is_none() {
+          bind.real_ip = Some(RealIpConfig::proxy_protocol_default());
+        }
+      }
+    }
+  }
 }
 
 #[cfg(test)]
@@ -447,6 +478,9 @@ services:
     assert_eq!(config.services[0].name, "ssh-prod");
     assert_eq!(config.services[0].binds[0].addr, "0.0.0.0:22222");
     assert_eq!(config.services[0].binds[0].proxy, Some("v2".to_string()));
+    let real_ip = config.services[0].binds[0].real_ip.as_ref().unwrap();
+    assert_eq!(real_ip.source, RealIpSource::ProxyProtocol);
+    assert!(real_ip.trust_private_ranges);
     assert_eq!(config.services[0].forward_to, Some("127.0.0.1:22".to_string()));
     assert_eq!(config.services[0].upstream_proxy, None);
   }

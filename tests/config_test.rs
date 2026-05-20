@@ -1,5 +1,5 @@
 use std::io::Write;
-use traudit::config::{Config, RealIpConfig};
+use traudit::config::{Config, RealIpConfig, RealIpSource};
 
 #[tokio::test]
 async fn test_error_on_unknown_fields() {
@@ -76,6 +76,32 @@ services:
   assert!(res.is_err());
   let err = res.err().unwrap().to_string();
   assert!(err.contains("proxy protocol support is not enabled"));
+}
+
+#[tokio::test]
+async fn test_proxy_implies_default_real_ip() {
+  let config_str = r#"
+database:
+  type: clickhouse
+  dsn: "http://127.0.0.1:8123"
+services:
+  - name: "proxy-default"
+    type: "tcp"
+    forward_to: "127.0.0.1:22"
+    binds:
+      - addr: "0.0.0.0:8000"
+        proxy: v2
+"#;
+  let mut file = tempfile::NamedTempFile::new().unwrap();
+  write!(file, "{}", config_str).unwrap();
+  let path = file.path().to_path_buf();
+
+  let config = Config::load(&path).await.unwrap();
+  let real_ip = config.services[0].binds[0].real_ip.as_ref().unwrap();
+  assert_eq!(real_ip.source, RealIpSource::ProxyProtocol);
+  assert!(real_ip.trust_private_ranges);
+  assert!(real_ip.trusted_proxies.is_empty());
+  assert_eq!(real_ip.xff_trust_depth, 0);
 }
 
 #[test]
